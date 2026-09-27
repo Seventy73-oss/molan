@@ -1030,7 +1030,7 @@ pub fn import_book(db: &Db, title: &str, genre: &str, files: &[Value]) -> Result
         write_file(db, &id, "正文", name, content)?;
         // 导入章标注来源：未经系统批准的章节不得被状态机当作 AI 定稿链推进（C3）
         if let Some(ch) = crate::continuity::chapter_number(name) {
-            if let Err(e) = crate::chapter_state::record_origin(&db, &id, ch, "import") {
+            if let Err(e) = crate::chapter_state::record_origin(db, &id, ch, "import") {
                 eprintln!("[molan-core] 导入章 origin 记账失败（不阻断导入）：{}", e);
             }
         }

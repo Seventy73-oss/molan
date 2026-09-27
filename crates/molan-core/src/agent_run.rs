@@ -184,11 +184,9 @@ pub fn charge_usage(db: &Db, run_id: &str, usage: Option<&Value>) -> Result<i64>
     )?;
     let row = get_run(db, run_id)?;
     Ok(row
-        .and_then(|r| {
-            Some(
-                r["usedPromptTokens"].as_i64().unwrap_or(0)
-                    + r["usedCompletionTokens"].as_i64().unwrap_or(0),
-            )
+        .map(|r| {
+            r["usedPromptTokens"].as_i64().unwrap_or(0)
+                + r["usedCompletionTokens"].as_i64().unwrap_or(0)
         })
         .unwrap_or(0))
 }
