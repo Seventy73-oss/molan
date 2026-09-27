@@ -1,4 +1,5 @@
 // molan-llm: 渠道管理 + OpenAI 兼容流式客户端（对齐 lib/llm.js）
+pub mod agent_transport;
 pub mod retry;
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
@@ -233,6 +234,10 @@ pub enum LlmEvent {
     Delta(String),
     Reasoning(String),
     Meta(Option<Value>),
+    /// 聚合完成的工具调用数组（OpenAI 兼容 tool_calls）：仅在
+    /// `StreamOpts::accept_tool_calls=true` 的 Agent 路径、流结束时一次性发送，
+    /// 不逐 delta 发送。旧正文消费方只需忽略该变体。
+    ToolCalls(Value),
 }
 
 #[derive(Clone)]
@@ -297,6 +302,9 @@ pub enum CompletionState {
     FinishStop,
     /// 兼容模式下的「看不出终止标记」：调用方**不得**据此自动定稿。
     Unverified,
+    /// 上游以 finish_reason=tool_calls 正常结束，且工具调用参数已聚合校验。
+    /// 仅 `accept_tool_calls=true` 的 Agent 路径可能出现；旧正文路径永不返回。
+    ToolCalls,
 }
 
 /// 不完整哨兵：响应被截断/缺少终止标记时用它结尾，绝不当成功。
@@ -327,9 +335,17 @@ pub fn is_resumable_err(e: &anyhow::Error) -> bool {
 
 /// 显式策略：默认严格（allow_missing_finish_reason=false）。
 /// 开启兼容只放宽「终止标记缺失」，length / content_filter 仍一律报错。
-#[derive(Debug, Clone, Copy, Default)]
+/// 工具传输默认全关（tools=None / accept_tool_calls=false），旧正文路径不变。
+/// 含 Value 故不再 Copy（旧调用方按值传入一次，不受影响）。
+#[derive(Debug, Clone, Default)]
 pub struct StreamOpts {
     pub allow_missing_finish_reason: bool,
+    /// Some 时在请求体注入 OpenAI 兼容 tools 字段；None = 不发（旧行为）。
+    pub tools: Option<serde_json::Value>,
+    /// Some 时随 tools 注入 tool_choice；None = 不发。
+    pub tool_choice: Option<serde_json::Value>,
+    /// 是否接受 finish_reason=tool_calls 作为正常结束（仅 Agent 路径开启）。
+    pub accept_tool_calls: bool,
 }
 
 /// 明确可接受的「正常收尾」finish_reason 白名单。
@@ -349,30 +365,9 @@ pub fn classify_completion(
     finish_reason: Option<&str>,
     allow_missing: bool,
 ) -> Result<CompletionState> {
-    match finish_reason.map(str::trim).filter(|s| !s.is_empty()) {
-        Some("length") => Err(anyhow!(
-            "{} 模型输出达到长度上限被截断（finish_reason=length），内容不完整",
-            INCOMPLETE_MSG
-        )),
-        Some("content_filter") => Err(anyhow!(
-            "{} 上游内容被安全策略过滤（finish_reason=content_filter）",
-            INCOMPLETE_MSG
-        )),
-        Some(fr) if ACCEPTED_FINISH_REASONS.contains(&fr) => {
-            Ok(if saw_done { CompletionState::Done } else { CompletionState::FinishStop })
-        }
-        Some(fr) => Err(anyhow!(
-            "{} 上游以 finish_reason={} 结束（非正常收尾，可能是工具调用/未知状态），不可作为完整正文",
-            INCOMPLETE_MSG,
-            fr
-        )),
-        None if saw_done => Ok(CompletionState::Done),
-        None if allow_missing => Ok(CompletionState::Unverified),
-        None => Err(anyhow!(
-            "{} 上游在给出 [DONE]/finish_reason 之前就结束了，无法确认内容完整",
-            INCOMPLETE_MSG
-        )),
-    }
+    // 旧正文路径永远不接受工具调用：委托给带开关的新函数并显式传 false，
+    // 保证 tool_calls/function_call/unknown 仍然一律判为不完整。
+    agent_transport::classify_completion_opts(saw_done, finish_reason, allow_missing, false)
 }
 
 fn finish_reason_of(j: &Value) -> Option<&str> {
@@ -479,12 +474,16 @@ fn decode_utf8_line(line: &[u8]) -> Result<String> {
 }
 
 /// 解析单行 SSE：派发 Delta/Reasoning，并记录 usage、[DONE] 与 finish_reason。
-fn handle_sse_line(
+/// accept_tool_calls=false 时 tool_calls 分片被静默丢弃（旧正文路径不变）；
+/// =true 时按 index 聚合进 tool_calls（冲突/协议损坏立即报不完整）。
+pub(crate) fn handle_sse_line(
     line: &str,
     tx: &tokio::sync::mpsc::UnboundedSender<LlmEvent>,
     usage: &mut Option<Value>,
     saw_done: &mut bool,
     finish_reason: &mut Option<String>,
+    tool_calls: &mut agent_transport::ToolCallAccumulator,
+    accept_tool_calls: bool,
 ) -> Result<()> {
     let line = line.trim();
     if line.is_empty() {
@@ -518,6 +517,8 @@ fn handle_sse_line(
             let _ = tx.send(LlmEvent::Delta(c.to_string()));
         }
     }
+    // 工具调用分片：非 accept 模式静默忽略（旧行为），accept 模式聚合校验。
+    tool_calls.collect_delta(delta, accept_tool_calls)?;
     if let Some(fr) = finish_reason_of(&j) {
         if !fr.trim().is_empty() {
             *finish_reason = Some(fr.to_string());
@@ -577,11 +578,16 @@ pub async fn chat_completion_stream_opts(
             .first()
             .and_then(|m| m["content"].as_str())
             .unwrap_or("");
-        let _user = params
-            .messages
-            .last()
-            .and_then(|m| m["content"].as_str())
-            .unwrap_or("");
+        // 最后一条 user 消息文本（无 role 时退回最后一条消息）。
+        let user = agent_transport::last_user_text(&params.messages);
+        // mock 确定性工具协议：仅当调用方给了 tools 且最后一条 user 文本含
+        // [call:<工具名>] 时，回一次该工具的 tool_call（id="mock-call-1"、arguments="{}"、
+        // finish_reason="tool_calls"）；否则维持原有 mock 正文/JSON 行为。
+        if let Some(calls) = agent_transport::mock_tool_calls(&opts, user) {
+            let _ = tx.send(LlmEvent::ToolCalls(calls));
+            let _ = tx.send(LlmEvent::Meta(None));
+            return Ok(CompletionState::ToolCalls);
+        }
         let body = if sys.contains("审读一章正文") {
             // 审核员（system 首句唯一标识；其 ok/issues 指令在 user 消息里）：
             // 返回「通过」的合法审核 JSON——此前审核永远解析失败→fail-closed 全转待审，
@@ -632,6 +638,9 @@ pub async fn chat_completion_stream_opts(
     if params.stream {
         body["stream_options"] = json!({"include_usage": true});
     }
+    // 仅当调用方显式给出 tools 时注入 OpenAI 兼容 tools / tool_choice；
+    // 旧路径（tools=None）请求体完全不变。
+    agent_transport::apply_tools(&mut body, &opts);
     let client = http_client();
     let mut resp = send_chat_request(client, &url, &params.api_key, &body, &params.cancel).await?;
     // 5xx 重试一次
@@ -680,15 +689,19 @@ pub async fn chat_completion_stream_opts(
             None => resp.json().await?,
         };
         // 非流式同样必须校验完成原因：length / content_filter / 缺失终止都不是成功。
-        let state = classify_completion(
+        // accept_tool_calls=true 时支持解析 message.tool_calls（缺失/非法仍报不完整）。
+        let message = &j["choices"][0]["message"];
+        let (state, calls) = agent_transport::classify_nonstream_message(
+            message,
             false,
             finish_reason_of(&j),
             opts.allow_missing_finish_reason,
+            opts.accept_tool_calls,
         )?;
-        let content = j["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        if let Some(calls) = calls {
+            let _ = tx.send(LlmEvent::ToolCalls(calls));
+        }
+        let content = message["content"].as_str().unwrap_or("").to_string();
         let _ = tx.send(LlmEvent::Delta(content));
         let _ = tx.send(LlmEvent::Meta(
             j["usage"].as_object().map(|_| j["usage"].clone()),
@@ -699,6 +712,7 @@ pub async fn chat_completion_stream_opts(
     let mut usage: Option<Value> = None;
     let mut saw_done = false;
     let mut finish_reason: Option<String> = None;
+    let mut tool_calls = agent_transport::ToolCallAccumulator::default();
     let mut stream = resp.bytes_stream();
     loop {
         // 读流与取消竞速：取消时 drop stream（断开连接），上游立即停算
@@ -715,20 +729,39 @@ pub async fn chat_completion_stream_opts(
         // 先攒原始字节、按完整行切分后再 UTF-8 解码：
         // 绝不 per-chunk lossy——否则「中」的 3 字节被网络拆开就会变成 U+FFFD。
         for line in buf.push(&bytes)? {
-            handle_sse_line(&line, tx, &mut usage, &mut saw_done, &mut finish_reason)?;
+            handle_sse_line(
+                &line,
+                tx,
+                &mut usage,
+                &mut saw_done,
+                &mut finish_reason,
+                &mut tool_calls,
+                opts.accept_tool_calls,
+            )?;
         }
     }
     // 最后一段可能没有换行结尾（例如裸 data: [DONE]），仍按一行解析。
     if let Some(line) = buf.finish()? {
         if !line.trim().is_empty() {
-            handle_sse_line(&line, tx, &mut usage, &mut saw_done, &mut finish_reason)?;
+            handle_sse_line(
+                &line,
+                tx,
+                &mut usage,
+                &mut saw_done,
+                &mut finish_reason,
+                &mut tool_calls,
+                opts.accept_tool_calls,
+            )?;
         }
     }
-    let state = classify_completion(
+    let state = agent_transport::classify_completion_opts(
         saw_done,
         finish_reason.as_deref(),
         opts.allow_missing_finish_reason,
+        opts.accept_tool_calls,
     )?;
+    // 工具调用：流结束时把聚合好的数组一次性发送（不逐 delta 发）。
+    agent_transport::finish_tool_calls(&tool_calls, state, opts.accept_tool_calls, tx)?;
     let _ = tx.send(LlmEvent::Meta(usage));
     Ok(state)
 }
@@ -778,6 +811,8 @@ pub async fn chat_once_logged_opts(
                 }
             }
             LlmEvent::Reasoning(_) => {}
+            // 一次性文本调用不消费工具调用（Agent 路径自行处理 ToolCalls）。
+            LlmEvent::ToolCalls(_) => {}
         }
     }
     Ok((full, usage))
@@ -942,6 +977,18 @@ mod tests {
         )
     }
 
+    /// 旧正文路径的单行解析（accept_tool_calls=false：tool_calls 静默丢弃）。
+    fn parse_line(
+        line: &str,
+        tx: &tokio::sync::mpsc::UnboundedSender<LlmEvent>,
+        usage: &mut Option<Value>,
+        saw_done: &mut bool,
+        fr: &mut Option<String>,
+    ) -> Result<()> {
+        let mut acc = agent_transport::ToolCallAccumulator::default();
+        handle_sse_line(line, tx, usage, saw_done, fr, &mut acc, false)
+    }
+
     // F13：SSE 数据在任意字节切点被网络拆开，正文必须逐字符完好，绝不 lossy 成 U+FFFD。
     #[test]
     fn utf8_survives_every_byte_split_in_chinese_and_emoji() {
@@ -973,7 +1020,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (mut usage, mut saw_done, mut fr) = (None, false, None);
         for l in &lines {
-            handle_sse_line(l, &tx, &mut usage, &mut saw_done, &mut fr).unwrap();
+            parse_line(l, &tx, &mut usage, &mut saw_done, &mut fr).unwrap();
         }
         drop(tx);
         let mut got = String::new();
@@ -1041,11 +1088,10 @@ mod tests {
     fn invalid_sse_json_is_error_not_silent_skip() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (mut usage, mut saw_done, mut fr) = (None, false, None);
-        let e = handle_sse_line("data: {not json", &tx, &mut usage, &mut saw_done, &mut fr)
-            .unwrap_err();
+        let e = parse_line("data: {not json", &tx, &mut usage, &mut saw_done, &mut fr).unwrap_err();
         assert!(is_incomplete_err(&e));
         // 非 data: 行（注释/心跳）仍应忽略
-        assert!(handle_sse_line(": ping", &tx, &mut usage, &mut saw_done, &mut fr).is_ok());
+        assert!(parse_line(": ping", &tx, &mut usage, &mut saw_done, &mut fr).is_ok());
     }
 
     // 上游一直不给换行：超过上限必须报错，避免无界缓冲 OOM。
@@ -1066,8 +1112,8 @@ mod tests {
             "data: {}",
             json!({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"total_tokens": 3}})
         );
-        handle_sse_line(&payload, &tx, &mut usage, &mut saw_done, &mut fr).unwrap();
-        handle_sse_line("data: [DONE]", &tx, &mut usage, &mut saw_done, &mut fr).unwrap();
+        parse_line(&payload, &tx, &mut usage, &mut saw_done, &mut fr).unwrap();
+        parse_line("data: [DONE]", &tx, &mut usage, &mut saw_done, &mut fr).unwrap();
         assert!(saw_done);
         assert_eq!(fr.as_deref(), Some("stop"));
         assert_eq!(usage.unwrap()["total_tokens"], json!(3));

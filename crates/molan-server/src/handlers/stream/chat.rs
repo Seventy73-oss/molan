@@ -179,6 +179,8 @@ pub(crate) async fn drain_chat_completion(
                         LlmEvent::Delta(t) => cx.delta(&t).await,
                         LlmEvent::Reasoning(t) => cx.reasoning(&t).await,
                         LlmEvent::Meta(_) => {}
+                        // Agent 工具传输层新增变体：旧对话流不消费，最小忽略臂。
+                        LlmEvent::ToolCalls(_) => {}
                     }
                 }
             }
@@ -191,6 +193,8 @@ pub(crate) async fn drain_chat_completion(
             LlmEvent::Delta(t) => cx.delta(&t).await,
             LlmEvent::Reasoning(t) => cx.reasoning(&t).await,
             LlmEvent::Meta(_) => {}
+            // Agent 工具传输层新增变体：旧对话流不消费，最小忽略臂。
+            LlmEvent::ToolCalls(_) => {}
         }
     }
     Ok(())
