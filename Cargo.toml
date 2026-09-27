@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["crates/molan-server", "crates/molan-core", "crates/molan-llm", "crates/molan-sources"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["http1"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+# rustls-tls：无 OpenSSL 依赖的 HTTPS。此前只有 json/stream/charset/gzip，
+# 实测 https:// 请求直接失败（"invalid URL, scheme is not http"），所有真实渠道都不可用。
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "gzip", "rustls-tls"] }
+futures-core = "0.3"
+futures-util = "0.3"
+scraper = "0.20"
+encoding_rs = "0.8"
+regex = "1"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+percent-encoding = "2"
+rand = "0.8"
+sha2 = "0.10"
+tempfile = "3"

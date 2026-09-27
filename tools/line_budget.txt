@@ -1,0 +1,16 @@
+crates/molan-server/src/handlers/mod.rs	3070
+crates/molan-server/src/handlers/stream/mod.rs	2075
+crates/molan-server/src/handlers/stream/chat.rs	1880
+crates/molan-server/src/handlers/stream/auto_write.rs	3557
+crates/molan-core/src/files.rs	2078
+# glue.js 2732->3210：存量业务本就超预算（本次改动前实测 3196 行，超 464 行，非本次新增导致）。
+# 构成：设置页写作面板（范围/双确认/记忆·分工·技能只读区）、Dock 写作链（进度卡片+续跑双确认+停止校验）、
+# 保存到书籍目录对话框（写前预检+二次确认+正文待审第N章硬门+单次 save_chat_output）、待审浮条与保留/丢弃条、
+# DeepWrite 工作台、墨案主题与移动端 CSS、书源整本下载。F8 已做最小充分去重：ipc 原始通道/latestChapterOf/
+# currentState 三组逐字重复实现收敛为共享 helper；确认与校验逻辑按要求未删。本次修复净 +6 行（3196->3202）。
+crates/molan-server/src/glue.js	3210
+crates/molan-server/src/main.rs	585
+crates/molan-core/src/continuity.rs	1040
+crates/molan-llm/src/lib.rs	1210
+crates/molan-server/src/auth.rs	970
+crates/molan-server/src/handlers/stream/decompose.rs	1151

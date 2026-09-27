@@ -1,0 +1,11 @@
+/* Reviewed book setup: neutral card surfaces and readable narrow-screen actions. */
+.booksetup__done-head { color: var(--c-text-secondary); }
+@media (max-width: 640px) {
+  .booksetup__foot, .booksetup__done-foot { flex-wrap: wrap; gap: 8px; }
+  .booksetup__foot .btn-solid, .booksetup__foot .btn-ghost,
+  .booksetup__done-foot .btn-solid, .booksetup__done-foot .btn-ghost {
+    height: auto; min-height: 40px; white-space: normal; line-height: 1.4;
+    flex: 1 1 100%; justify-content: center; padding: 8px 12px;
+  }
+  .booksetup__done-hint { flex: 1 1 100%; }
+}

@@ -1,0 +1,13 @@
+[package]
+name = "molan-sources"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+scraper = { workspace = true }
+encoding_rs = { workspace = true }
+anyhow = { workspace = true }
+futures-core = { workspace = true }

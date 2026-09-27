@@ -1,0 +1,27 @@
+/* Explicit book/file destinations. Keep controls readable at the card's actual width. */
+.booksetup-v2{container-type:inline-size;width:100%;max-width:none;box-sizing:border-box;background:var(--c-white,#fff);color:var(--c-text-main);border:1px solid var(--c-border-2);padding:16px;border-radius:12px;overflow-wrap:anywhere;}
+.booksetup-v2__heading{font:600 16px/1.5 var(--font-ui, sans-serif);margin:0 0 8px;}
+.booksetup-v2__hint{font-size:12px;line-height:1.7;color:var(--c-text-secondary);margin:8px 0;}
+.booksetup-v2__destination,.booksetup-v2__bound{display:flex;flex-direction:column;gap:12px;padding:12px;background:var(--c-center-bg);border-radius:8px;}
+.booksetup-v2 label{display:flex;flex-direction:column;gap:6px;min-width:0;font-size:12px;}
+.booksetup-v2 input,.booksetup-v2 select{width:100%;min-width:0;box-sizing:border-box;min-height:38px;border:1px solid var(--c-border-btn);border-radius:6px;padding:6px 8px;font:inherit;background:var(--c-white);color:var(--c-text-main);}
+.booksetup-v2__target,.booksetup-v2__fullpath{font-size:12px;line-height:1.7;overflow-wrap:anywhere;color:var(--c-text-secondary);}
+.booksetup-v2__filetop{display:flex;gap:12px;align-items:center;}
+.booksetup-v2__filetop .booksetup__file-toggle{font-weight:600;overflow-wrap:anywhere;line-height:1.6;}
+.booksetup-v2__path{display:grid;grid-template-columns:minmax(110px,1fr) minmax(0,2fr);gap:12px;margin:12px 0 6px;}
+.booksetup-v2 .booksetup__full{max-height:360px;overflow:auto;}
+.booksetup-v2 .booksetup__foot{display:flex;flex-wrap:wrap;margin-top:16px;}
+.booksetup-v2 .btn-solid,.booksetup-v2 .btn-ghost{height:auto;min-height:40px;white-space:normal;line-height:1.5;padding:8px 12px;}
+.booksetup-v2 .booksetup__foot .btn-solid{flex:1 1 100%;}
+.booksetup-v2__error{border:1px solid var(--c-border-2);padding:12px;margin-top:12px;background:var(--c-center-bg);color:var(--c-text-main);font-size:13px;line-height:1.6;}
+.booksetup-v2 button:disabled{opacity:.55;cursor:not-allowed;}
+@container (max-width:380px){.booksetup-v2__path{grid-template-columns:1fr;}.booksetup-v2__filetop{flex-wrap:wrap;}.booksetup-v2__filetop .booksetup__file-toggle{flex-basis:100%;}}
+/* The whole message must track its chat column after splitter/sidebars change. */
+.centerstage .chat,.centerstage .msgscroll-wrap,.centerstage .msgscroll{min-width:0;}
+.centerstage .msgscroll,.centerstage .msgscroll__inner{width:100%;box-sizing:border-box;}
+.centerstage .aimsg{width:100%;box-sizing:border-box;}
+.centerstage .aimsg__body{flex:1 1 0%;min-width:0;}
+.centerstage.molan-single-pane .editorpane.is-open{position:absolute!important;inset:0!important;width:100%!important;max-width:100%!important;transform:none;opacity:1;pointer-events:auto;}
+.centerstage.molan-single-pane #molan-splitbar{display:none!important;}
+.centerstage .editorpane{min-width:0;}
+@media(min-width:851px){.centerstage:not(.molan-single-pane) .editorpane.is-open{position:relative;inset:auto;transform:none;opacity:1;pointer-events:auto;}}

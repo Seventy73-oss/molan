@@ -1,0 +1,32 @@
+[package]
+name = "molan-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "molan-server"
+path = "src/main.rs"
+
+[dependencies]
+molan-core = { path = "../molan-core" }
+molan-llm = { path = "../molan-llm" }
+molan-sources = { path = "../molan-sources" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tokio-util = "0.7"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+tokio-stream = "0.1"
+percent-encoding = { workspace = true }
+# 网页导出（F）：base64 产物 + stored 模式 zip，仅 std 依赖，避免压缩/加密特性
+base64 = "0.22"
+zip = { version = "2", default-features = false }
+# 导出临时快照：RAII 保证异常路径也删除含凭据的临时库
+tempfile = "3"
+uuid = { workspace = true }
+rusqlite = { workspace = true }
