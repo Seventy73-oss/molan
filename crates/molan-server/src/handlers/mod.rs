@@ -648,11 +648,26 @@ pub async fn dispatch(
                 {
                     outline = o.chars().take(200).collect();
                 }
+                // 依赖账本状态（null=未登记）：stale 表示父稿已变，批准前必须重审
+                let dep = db
+                    .q_json(
+                        "SELECT status FROM draft_dependency WHERE book_id=?1 AND ch=?2",
+                        &[
+                            &book_id as &dyn rusqlite::ToSql,
+                            &ch as &dyn rusqlite::ToSql,
+                        ],
+                    )
+                    .ok()
+                    .and_then(|v| {
+                        v.first()
+                            .and_then(|r| r["status"].as_str().map(str::to_string))
+                    });
                 out.push(json!({
                     "ch": ch, "name": name,
                     "words": content.chars().count(),
                     "preview": content.chars().take(160).collect::<String>(),
                     "outline": outline,
+                    "dependencyStatus": dep,
                     "deai": molan_core::deai::score_text(&content)["score"],
                 }));
             }
@@ -675,7 +690,7 @@ pub async fn dispatch(
                     // 兼容只传 ch 的调用方：从队列反查文件名
                     let ch = a("ch").as_i64().unwrap_or(0);
                     db.q_json(
-                        "SELECT review_file FROM pending_chapter WHERE book_id=?1 AND ch=?2",
+                        "SELECT review_file FROM pending_chapter WHERE book_id=?1 AND ch=?2 AND status='pending'",
                         &[
                             &book_id as &dyn rusqlite::ToSql,
                             &ch as &dyn rusqlite::ToSql,
@@ -815,6 +830,13 @@ pub async fn dispatch(
                         approved.push(ch);
                         let real_ch = chapter_num_from_name(&final_name).unwrap_or(ch);
                         if real_ch > 0 {
+                            // G6：批量与单章审批路径状态机记账对等（只观测不阻断）
+                            let _ = molan_core::chapter_state::record_approved(
+                                db,
+                                &book_id,
+                                real_ch,
+                                json!({"finalName": final_name, "by": "manual_approve_all"}),
+                            );
                             spawn_post_approved(Arc::clone(st), &book_id, real_ch);
                         }
                     }
