@@ -61,6 +61,11 @@ impl Db {
         crate::chapter_state::ensure_schema(&db)?;
         crate::facts::ensure_schema(&db)?;
         crate::ctx_manifest::ensure_schema(&db)?;
+        crate::agent_run::ensure_schema(&db)?;
+        // 启动自愈中断的审批 saga；失败不阻断启动（审批入口仍按 hash 判据自愈）
+        if let Err(e) = crate::approval::recover_approvals(&db) {
+            eprintln!("[molan-core] 审批 saga 恢复未完成：{}", e);
+        }
         Ok(db)
     }
 
@@ -194,6 +199,26 @@ impl Db {
                 UNIQUE(book_id, ch)
             );",
         )?;
+        // 审批 saga 恢复列（附录 A3.3）：草稿/正式指纹 + 相位标记。探测式幂等补列，
+        // 样板同 books.deleted_at。恢复判据以磁盘 hash 为准，相位只是加速提示。
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(pending_chapter)")?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if !cols.iter().any(|c| c == "draft_hash") {
+                conn.execute_batch("ALTER TABLE pending_chapter ADD COLUMN draft_hash TEXT")?;
+            }
+            if !cols.iter().any(|c| c == "formal_hash") {
+                conn.execute_batch("ALTER TABLE pending_chapter ADD COLUMN formal_hash TEXT")?;
+            }
+            if !cols.iter().any(|c| c == "approve_phase") {
+                conn.execute_batch(
+                    "ALTER TABLE pending_chapter ADD COLUMN approve_phase TEXT NOT NULL DEFAULT ''",
+                )?;
+            }
+        }
         // LLM 调用用量落账：每次调用的 token 消耗（细纲/正文/审核/重写/人物状态/伏笔/摘要/体检）
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS llm_call_log (
@@ -345,6 +370,40 @@ mod tests {
             listed.as_array().unwrap().iter().any(|r| r["id"] == sid),
             "create_session 之后 list_sessions 必须能看到新会话"
         );
+    }
+
+    /// 老库 pending_chapter 缺 saga 列时，open 必须幂等补列且保留既有行。
+    #[test]
+    fn legacy_pending_chapter_gains_saga_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("writerx.db");
+        {
+            let c = Connection::open(&db_path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE pending_chapter (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    book_id TEXT NOT NULL, ch INTEGER NOT NULL,
+                    review_file TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at INTEGER, updated_at INTEGER,
+                    UNIQUE(book_id, ch));
+                 INSERT INTO pending_chapter(book_id,ch,review_file,status,created_at,updated_at)
+                 VALUES('b',1,'第1章.md','pending',0,0);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(dir.path(), None).unwrap();
+        let row = &db
+            .q_json(
+                "SELECT status, draft_hash, formal_hash, approve_phase FROM pending_chapter WHERE book_id='b'",
+                &[],
+            )
+            .unwrap()[0];
+        assert_eq!(row["status"], "pending");
+        assert_eq!(row["approvePhase"], "");
+        // 再开一次仍幂等
+        drop(db);
+        assert!(Db::open(dir.path(), None).is_ok());
     }
 
     #[test]

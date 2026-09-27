@@ -1,3 +1,5 @@
+pub mod agent_run;
+pub mod approval;
 pub mod book_setup;
 pub mod books;
 pub mod chapter_state;

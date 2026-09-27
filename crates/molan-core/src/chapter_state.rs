@@ -63,6 +63,7 @@ pub fn ensure_schema(db: &Db) -> Result<()> {
                 humanize_hash TEXT, memory_hash TEXT,
                 fact_count INTEGER NOT NULL DEFAULT 0,
                 task_id TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
+                origin TEXT NOT NULL DEFAULT 'ai',
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY(book_id,ch));
              CREATE TABLE IF NOT EXISTS chapter_state_event (
@@ -73,7 +74,41 @@ pub fn ensure_schema(db: &Db) -> Result<()> {
                 created_at INTEGER NOT NULL);
              CREATE INDEX IF NOT EXISTS idx_chapter_state_event ON chapter_state_event(book_id,ch,id);",
         )?;
+    // origin 列（C3）：章节来源 ai/human/import。老库探测式补列，缺列绝不带病运行。
+    {
+        let conn = db.conn.lock().map_err(|_| anyhow!("数据库锁损坏"))?;
+        let has_origin = {
+            let mut stmt = conn.prepare("PRAGMA table_info(chapter_state)")?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            cols.iter().any(|c| c == "origin")
+        };
+        if !has_origin {
+            conn.execute_batch(
+                "ALTER TABLE chapter_state ADD COLUMN origin TEXT NOT NULL DEFAULT 'ai'",
+            )?;
+        }
+    }
     Ok(())
+}
+
+/// 标注章节来源（C3）：默认 ai 可升级为 import/human；已显式标注的来源不被覆盖，
+/// 导入/手写章因此不会被记忆重建误推进到 MEMORY_SYNCED（批准语义只属于系统审批链）。
+pub fn record_origin(db: &Db, book: &str, ch: i64, origin: &str) -> Result<()> {
+    if !matches!(origin, "ai" | "human" | "import") {
+        return Err(anyhow!("非法章节来源：{}", origin));
+    }
+    with_tx(db, |tx, now| {
+        tx.execute(
+            "INSERT INTO chapter_state(book_id,ch,state,origin,updated_at) VALUES(?1,?2,'',?3,?4)
+             ON CONFLICT(book_id,ch) DO UPDATE SET origin=excluded.origin,updated_at=excluded.updated_at
+             WHERE chapter_state.origin='ai'",
+            params![book, ch, origin, now],
+        )?;
+        Ok(())
+    })
 }
 
 /// 锁内迁移判定：返回实际落库状态。指纹/计数等字段由调用方另行 UPDATE。
@@ -345,15 +380,29 @@ pub fn memory_synced_tx(
          ON CONFLICT(book_id,ch) DO UPDATE SET memory_hash=excluded.memory_hash,fact_count=excluded.fact_count,updated_at=excluded.updated_at",
         params![book, ch, memory_hash, fact_count, now],
     )?;
-    apply_tx(
-        tx,
-        book,
-        ch,
-        MEMORY_SYNCED,
-        &json!({"memoryHash": memory_hash, "factCount": fact_count}),
-        now,
-        false,
-    )?;
+    // C3：人工/导入章记忆建成 ≠ 系统批准。origin!='ai' 封顶 SAVED，
+    // 「已建仓」用 memory_hash/fact_count 表达，不推进 MEMORY_SYNCED。
+    let origin: String = tx
+        .query_row(
+            "SELECT origin FROM chapter_state WHERE book_id=?1 AND ch=?2",
+            params![book, ch],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "ai".to_string());
+    let (to, note) = if origin == "ai" {
+        (MEMORY_SYNCED, Value::Null)
+    } else {
+        (
+            SAVED,
+            json!(format!("{} 来源章记忆已建，不等价于系统批准", origin)),
+        )
+    };
+    let mut detail = json!({"memoryHash": memory_hash, "factCount": fact_count});
+    if !note.is_null() {
+        detail["note"] = note;
+        detail["origin"] = json!(origin);
+    }
+    apply_tx(tx, book, ch, to, &detail, now, false)?;
     Ok(())
 }
 
@@ -526,6 +575,57 @@ mod tests {
             .unwrap()
             .to_string();
         (dir, db, book)
+    }
+
+    #[test]
+    fn origin_import_caps_memory_synced_at_saved() {
+        // C3：导入章记忆建成不得推进 MEMORY_SYNCED（rank 高于 APPROVED 的语义漂移）
+        let (_d, db, book) = fixture();
+        record_origin(&db, &book, 1, "import").unwrap();
+        {
+            let mut conn = db.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            memory_synced_tx(&tx, &book, 1, "hash-m", 3, crate::stats::now_ms()).unwrap();
+            tx.commit().unwrap();
+        }
+        let st = db
+            .q_json(
+                "SELECT state, origin, memory_hash, fact_count FROM chapter_state WHERE book_id=?1 AND ch=1",
+                params![book],
+            )
+            .unwrap();
+        assert_eq!(st[0]["state"], SAVED, "导入章封顶 SAVED");
+        assert_eq!(st[0]["origin"], "import");
+        assert_eq!(st[0]["memoryHash"], "hash-m", "「已建仓」用记忆指纹表达");
+        assert_eq!(st[0]["factCount"].as_i64().unwrap(), 3);
+    }
+
+    #[test]
+    fn origin_ai_reaches_memory_synced_and_explicit_origin_is_sticky() {
+        let (_d, db, book) = fixture();
+        {
+            let mut conn = db.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            memory_synced_tx(&tx, &book, 2, "h2", 1, crate::stats::now_ms()).unwrap();
+            tx.commit().unwrap();
+        }
+        let st = db
+            .q_json(
+                "SELECT state FROM chapter_state WHERE book_id=?1 AND ch=2",
+                params![book],
+            )
+            .unwrap();
+        assert_eq!(st[0]["state"], MEMORY_SYNCED, "AI 章语义不变");
+        record_origin(&db, &book, 2, "import").unwrap();
+        record_origin(&db, &book, 2, "human").unwrap();
+        let st2 = db
+            .q_json(
+                "SELECT origin FROM chapter_state WHERE book_id=?1 AND ch=2",
+                params![book],
+            )
+            .unwrap();
+        assert_eq!(st2[0]["origin"], "import", "显式来源不被再次覆盖");
+        assert!(record_origin(&db, &book, 2, "alien").is_err());
     }
 
     #[test]

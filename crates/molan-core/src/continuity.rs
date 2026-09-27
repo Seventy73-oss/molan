@@ -117,9 +117,9 @@ pub fn note_file_change(
                 .map(String::as_str)
                 .unwrap_or("");
             tx.execute("UPDATE draft_dependency SET status='stale',updated_at=?4 WHERE book_id=?1 AND parent_ch=?2 AND parent_hash<>?3",params![book,ch,effective,now])?;
-            // Conservatively invalidate the entire downstream draft chain once any
-            // dependency is stale; never erase its text or silently approve it.
-            tx.execute("UPDATE draft_dependency SET status='stale',updated_at=?2 WHERE book_id=?1 AND ch>(SELECT MIN(ch) FROM draft_dependency WHERE book_id=?1 AND status='stale')",params![book,now])?;
+            // Cascade only from rows staled by THIS change (updated_at=now): historical
+            // stale rows must not re-amplify later edits (C5); re-registration clears.
+            tx.execute("UPDATE draft_dependency SET status='stale',updated_at=?2 WHERE book_id=?1 AND ch>(SELECT MIN(ch) FROM draft_dependency WHERE book_id=?1 AND status='stale' AND updated_at=?2)",params![book,now])?;
         }
     }
     if group == "正文待审" && new.is_none() {
@@ -608,7 +608,22 @@ pub fn check_draft_dependency(db: &Db, book: &str, ch: i64) -> Result<()> {
 /// edit and therefore cannot prove which text was accepted earlier.
 pub fn record_approval(db: &Db, book: &str, ch: i64, name: &str, hash: &str) -> Result<()> {
     ensure_schema(db)?;
-    db.exec("INSERT INTO continuity_event(book_id,kind,detail_json,created_at) VALUES(?1,'chapter_approved',?2,?3)",&[&book,&json!({"chapter":ch,"name":name,"sourceHash":hash}).to_string(),&now_ms()])?;
+    let mut conn = db.conn.lock().map_err(|_| anyhow!("数据库锁损坏"))?;
+    let tx = conn.transaction()?;
+    record_approval_tx(&tx, book, ch, name, hash, now_ms())?;
+    Ok(tx.commit()?)
+}
+
+/// 凭证的事务内版本：审批 saga 要求队列 UPDATE 与凭证 INSERT 同事务（approval.rs）。
+pub fn record_approval_tx(
+    tx: &rusqlite::Transaction,
+    book: &str,
+    ch: i64,
+    name: &str,
+    hash: &str,
+    now: i64,
+) -> Result<()> {
+    tx.execute("INSERT INTO continuity_event(book_id,kind,detail_json,created_at) VALUES(?1,'chapter_approved',?2,?3)",params![book,json!({"chapter":ch,"name":name,"sourceHash":hash}).to_string(),now])?;
     Ok(())
 }
 

@@ -122,7 +122,12 @@ fn book_base(db: &Db, book_id: &str, group: &str, name: &str) -> PathBuf {
         .join(safe_name(name))
 }
 
-fn book_base_checked(db: &Db, book_id: &str, group: &str, name: &str) -> Result<PathBuf> {
+pub(crate) fn book_base_checked(
+    db: &Db,
+    book_id: &str,
+    group: &str,
+    name: &str,
+) -> Result<PathBuf> {
     let g = normalize_group(group);
     if g == "_invalid_" {
         bail!("非法分组名：{:?}", group);
@@ -361,7 +366,13 @@ fn index_error(canon: &str, name: &str, e: anyhow::Error) -> anyhow::Error {
 }
 
 /// 锁内写：调用方必须已持有 db.fs_lock。失败不更新统计、不删源稿。
-fn write_file_locked(db: &Db, book_id: &str, group: &str, name: &str, content: &str) -> Result<()> {
+pub(crate) fn write_file_locked(
+    db: &Db,
+    book_id: &str,
+    group: &str,
+    name: &str,
+    content: &str,
+) -> Result<()> {
     let canon = normalize_group(group);
     if canon == "_invalid_" {
         bail!("非法分组名：{:?}", group);
@@ -579,6 +590,16 @@ pub fn rename_file(db: &Db, book_id: &str, group: &str, name: &str, new_name: &s
 
 pub fn delete_file(db: &Db, book_id: &str, group: &str, name: &str) -> Result<String> {
     let _g = db.fs_lock.lock().unwrap_or_else(|e| e.into_inner());
+    delete_file_locked(db, book_id, group, name)
+}
+
+/// 锁内删除：调用方必须已持有 db.fs_lock（审批清理复用；fs_lock 不可重入，直接调 delete_file 会死锁）。
+pub(crate) fn delete_file_locked(
+    db: &Db,
+    book_id: &str,
+    group: &str,
+    name: &str,
+) -> Result<String> {
     let canon = normalize_group(group);
     if canon == "_invalid_" {
         bail!("非法分组名：{:?}", group);
@@ -812,111 +833,10 @@ pub fn clear_file_trash(db: &Db, book_id: &str) -> Result<()> {
 /// - 正式组同名非空稿已存在 → Err（不再用 mtime 猜测改名 .ai）；
 /// - 只有目标持久化成功后才删除唯一待审源稿；任何 IO 失败都保住原稿并返回 Err。
 pub fn approve_pending_chapter(db: &Db, book_id: &str, name: &str) -> Result<String> {
+    // 审批唯一入口。saga 原子性（队列+批准凭证单事务）、窗口A（正文已写队列未更）自愈、
+    // 带 note_file_change 记账的待审清理，实现移至 approval.rs；本入口保持 fs_lock 全程锁内契约。
     let _g = db.fs_lock.lock().unwrap_or_else(|e| e.into_inner());
-    if book_id.trim().is_empty() || name.trim().is_empty() {
-        bail!("缺少 bookId/name");
-    }
-    let review_path = book_base_checked(db, book_id, crate::db::REVIEW_GROUP, name)?;
-    if !review_path.is_file() {
-        bail!("待审文件不存在：{}", name);
-    }
-    // 依赖检查：本待审稿依赖的前序章若已变更/驳回，必须重审而不是直接定稿
-    if let Some(ch) = crate::continuity::chapter_number(name) {
-        crate::continuity::check_draft_dependency(db, book_id, ch)
-            .with_context(|| format!("待审依赖检查失败：第{}章", ch))?;
-    }
-    // 队列预检（写盘之前）：只有 pending 记录可被接受。
-    // 没有队列记录（或已被驳回）时必须在写盘前拒绝，避免“先写正式稿再发现无队列”。
-    let rows = db.q_json(
-        "SELECT status FROM pending_chapter WHERE book_id=?1 AND review_file=?2",
-        &[
-            &book_id as &dyn rusqlite::ToSql,
-            &name as &dyn rusqlite::ToSql,
-        ],
-    )?;
-    let queue_status = rows
-        .first()
-        .and_then(|r| r["status"].as_str())
-        .map(|s| s.to_string());
-    match queue_status.as_deref() {
-        Some("pending") => {}
-        Some(other) => {
-            bail!(
-                "待审记录状态为 {}，不是 pending，拒绝接受（请先重审或重新生成）",
-                other
-            );
-        }
-        None => {
-            // 已有批准凭证且正式稿 hash 一致 => 幂等重入，直接返回
-            if let Some(ch) = crate::continuity::chapter_number(name) {
-                let receipt = crate::continuity::approved_hash(db, book_id, name).unwrap_or(None);
-                if let Some(h) = receipt {
-                    if let Some(cur) = read_file(db, book_id, "正文", &safe_name(name)) {
-                        if crate::continuity::content_hash(&cur) == h {
-                            return Ok(safe_name(name));
-                        }
-                    }
-                }
-                let _ = ch;
-            }
-            bail!("没有待审记录（队列不存在），拒绝接受：{}", name);
-        }
-    }
-    let final_name = safe_name(name);
-    let final_path = book_base_checked(db, book_id, "正文", &final_name)?;
-    if final_path.is_file()
-        && !std::fs::read_to_string(&final_path)
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-    {
-        bail!("正式稿已存在，拒绝覆盖：正文/{}", final_name);
-    }
-    let content = std::fs::read_to_string(&review_path).context("读取待审稿失败")?;
-    // 1) 正文持久化（原子）
-    write_file_locked(db, book_id, "正文", &final_name, &content)?;
-    // 2) 队列状态必须与正文一致，才允许删除唯一待审源稿（契约：target 持久化 + 队列一致）
-    let updated = match db.exec(
-        "UPDATE pending_chapter SET status='approved', updated_at=?2 WHERE book_id=?1 AND review_file=?3",
-        &[
-            &book_id as &dyn rusqlite::ToSql,
-            &crate::stats::now_ms(),
-            &name as &dyn rusqlite::ToSql,
-        ],
-    ) {
-        Ok(n) => n,
-        Err(e) => {
-            // DB 故障（如触发器/约束）：正文已落盘，保留待审源稿以便重试，绝不静默成功
-            return Err(anyhow!(
-                "正文已保存为 {}，但审批队列更新失败（待审源稿已保留）：{}",
-                final_name,
-                e
-            ));
-        }
-    };
-    if updated == 0 {
-        // 正文已保存，但队列不一致：保留待审源稿以便重试，绝不静默成功
-        return Err(anyhow!(
-            "正文已保存为 {}，但审批队列记录不一致（未找到待审记录），已保留待审源稿以便重试",
-            final_name
-        ));
-    }
-    // 3) 记录不可变批准凭证（供重入校验）；失败必须保住待审源稿
-    if let Some(ch) = crate::continuity::chapter_number(&final_name) {
-        let hash = crate::continuity::content_hash(&content);
-        crate::continuity::record_approval(db, book_id, ch, &final_name, &hash).map_err(|e| {
-            anyhow!(
-                "正文已保存为 {}，但批准凭证写入失败（待审源稿已保留）：{}",
-                final_name,
-                e
-            )
-        })?;
-    }
-    // 4) 只有前面都成功，才删除唯一待审源稿
-    if let Err(e) = std::fs::remove_file(&review_path) {
-        eprintln!("[molan-core] 待审源稿清理失败（正文已保存）：{}", e);
-    }
-    Ok(final_name)
+    crate::approval::approve_locked(db, book_id, name)
 }
 
 // ---------- 用户自定义文件夹 ----------
@@ -1108,6 +1028,12 @@ pub fn import_book(db: &Db, title: &str, genre: &str, files: &[Value]) -> Result
         let name = f["name"].as_str().unwrap_or("章节.md");
         let content = f["content"].as_str().unwrap_or("");
         write_file(db, &id, "正文", name, content)?;
+        // 导入章标注来源：未经系统批准的章节不得被状态机当作 AI 定稿链推进（C3）
+        if let Some(ch) = crate::continuity::chapter_number(name) {
+            if let Err(e) = crate::chapter_state::record_origin(&db, &id, ch, "import") {
+                eprintln!("[molan-core] 导入章 origin 记账失败（不阻断导入）：{}", e);
+            }
+        }
     }
     Ok(json!({"bookId": id}))
 }

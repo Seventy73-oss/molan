@@ -620,7 +620,8 @@ pub async fn dispatch(
                 )
                 .unwrap_or_default(),
             );
-            let mut state = molan_core::pipeline::derive_state(&tree, &queue);
+            let mut state =
+                molan_core::pipeline::derive_state_with_memory(db, &book_id, &tree, &queue);
             state["bookId"] = json!(book_id);
             let next = state["next"].clone();
             state["nextContext"] = stream::stage_context::preview(db, &book_id, &next);
