@@ -298,26 +298,33 @@ pub fn last_user_text(messages: &[Value]) -> &str {
         .unwrap_or("")
 }
 
-/// mock:// 工具协议标记：[call:<工具名>]（工具名不含 ']'，取首个标记）。
-pub fn mock_tool_call_name(text: &str) -> Option<String> {
+/// mock:// 工具协议：[call:<工具名>] 或 [call:<工具名> <json参数>]（取首个标记；json 参数内不得含 ']'）。
+pub fn mock_tool_call_parse(text: &str) -> Option<(String, String)> {
     let start = text.find("[call:")?;
     let rest = &text[start + "[call:".len()..];
     let end = rest.find(']')?;
-    let name = rest[..end].trim();
-    (!name.is_empty()).then(|| name.to_string())
+    let inner = &rest[..end];
+    let (name, args) = match inner.find('{') {
+        Some(b) => (inner[..b].trim(), inner[b..].trim()),
+        None => (inner.trim(), "{}"),
+    };
+    (!name.is_empty()).then(|| (name.to_string(), args.to_string()))
 }
 
-/// mock:// 确定性工具协议：仅当调用方给了 tools 且最后一条 user 文本含
-/// [call:<工具名>] 时，返回该工具的一次 tool_call
-/// （id="mock-call-1"、arguments="{}"、finish_reason=tool_calls）。
-/// 无标记则返回 None，走原有 mock 正文/JSON 分支。
+/// 兼容入口：只取工具名。
+pub fn mock_tool_call_name(text: &str) -> Option<String> {
+    mock_tool_call_parse(text).map(|(n, _)| n)
+}
+
+/// mock:// 确定性工具协议：调用方给了 tools 且最后一条 user 文本含 [call:…] 标记时，
+/// 返回该工具的一次 tool_call（id="mock-call-1"）。无标记返回 None，走原有 mock 正文分支。
 pub fn mock_tool_calls(opts: &StreamOpts, last_user_text: &str) -> Option<Value> {
     opts.tools.as_ref()?;
-    let name = mock_tool_call_name(last_user_text)?;
+    let (name, arguments) = mock_tool_call_parse(last_user_text)?;
     Some(json!([{
         "id": "mock-call-1",
         "type": "function",
-        "function": { "name": name, "arguments": "{}" }
+        "function": { "name": name, "arguments": arguments }
     }]))
 }
 

@@ -10,6 +10,7 @@ pub mod deai;
 pub mod deepwrite;
 pub mod facts;
 pub mod files;
+pub mod outline_confirm;
 pub mod pipeline;
 pub mod setup_destination;
 pub mod setup_workspace;

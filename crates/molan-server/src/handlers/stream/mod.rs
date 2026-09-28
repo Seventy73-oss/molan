@@ -36,7 +36,7 @@ pub(crate) fn log_llm_usage(
 
 /// 严格章节标题判定（S04）：必须是「第<数字/中文数字>章 …」开头的独立标题行，
 /// 不接受「他翻到第三章」这类正文句子，也不接受超长行。
-fn is_chapter_head(line: &str) -> bool {
+pub(crate) fn is_chapter_head(line: &str) -> bool {
     let t = line.trim().trim_start_matches('#').trim();
     // 必须按字符剥离「第」：它是 3 字节，字节索引 [1..] 会 panic（线上实例：第1章 捡回来的魔尊）
     let Some(after) = t.strip_prefix('第') else {
@@ -76,117 +76,8 @@ pub(crate) fn parse_chapter_title(line: &str) -> Option<(i64, bool)> {
     Some((num, is_outline))
 }
 
-/// 聊天产出落盘（F07 / 契约 C）：正文一律进入「正文待审」审批队列，
-/// 绝不覆盖已有正式稿或已有待审稿；细纲只新建不覆盖。
-/// 只有真正写盘成功才计入 saved；任一写入失败返回 Err，绝不假成功。
-/// 带「锁内前置校验」的落盘：`check` 在每次 AI 写盘进入 fs_lock 之后、写盘之前执行
-/// （取消/依赖等），因此不存在 check/write 竞态，也不会与外部加锁形成死锁。
-/// check 每个文件都会被调用一次，返回 Err 即拒绝写入。
-pub(crate) fn auto_save_chat_output_checked<F>(
-    db: &molan_core::db::Db,
-    book_id: &str,
-    full: &str,
-    _explicit_ch: Option<i64>,
-    suppress_body: bool,
-    check: F,
-) -> Result<(Vec<String>, Vec<String>)>
-where
-    F: Fn() -> Result<()>,
-{
-    let mut saved = Vec::new();
-    let mut skipped = Vec::new();
-    if book_id.is_empty() || full.chars().count() < 120 {
-        return Ok((saved, skipped));
-    }
-    let lines: Vec<&str> = full.lines().collect();
-    let mut i = 0usize;
-    while i < lines.len() {
-        let head = lines[i].trim_start();
-        if !head.starts_with('#') {
-            i += 1;
-            continue;
-        }
-        let Some((num, is_outline)) = parse_chapter_title(head) else {
-            i += 1;
-            continue;
-        };
-        let mut j = i + 1;
-        let mut body = String::new();
-        while j < lines.len() && !is_chapter_head(lines[j]) {
-            body.push_str(lines[j]);
-            body.push('\n');
-            j += 1;
-        }
-        let body = body.trim().to_string();
-        i = j;
-        if body.chars().count() < 150 {
-            continue;
-        }
-        if is_outline {
-            let fname = format!("细纲_第{}章.md", num);
-            if files::read_file(db, book_id, "细纲", &fname).is_some() {
-                skipped.push(format!("细纲 / {} 已存在，未覆盖", fname));
-                continue;
-            }
-            // 细纲也是 AI 产稿：走 checked（只新建、锁内校验、locked 拒绝）
-            if let Err(e) = files::write_ai_file_checked(db, book_id, "细纲", &fname, &body, &check)
-            {
-                skipped.push(format!("细纲 / {} 未保存：{}", fname, e));
-                continue;
-            }
-            // 章节状态机（P0-2）：只观测不阻断，记账失败不影响已落盘文件
-            let _ = molan_core::chapter_state::record_outline(
-                db,
-                book_id,
-                num,
-                &molan_core::continuity::content_hash(&body),
-            );
-            saved.push(format!("细纲 / {}", fname));
-        } else if suppress_body {
-            // 细纲/大纲指令的产出绝不进正文组：正文段整段跳过（全链路 S2 回归锁）
-            tracing::info!("细纲指令产出按 suppress_body 跳过正文落盘（第{}章）", num);
-            skipped.push(format!(
-                "第{}章正文段按细纲/大纲指令跳过（不进正文组）；如需保留请点击「保存到书籍目录」",
-                num
-            ));
-            continue;
-        } else {
-            // 正文只能生成待审稿：新章也需作者明确接受后才进入正式正文。
-            // 待审已存在则拒绝，绝不覆盖正式稿或已有待审稿。
-            let fname = format!("第{}章.md", num);
-            if files::read_file(db, book_id, molan_core::db::REVIEW_GROUP, &fname).is_some() {
-                skipped.push(format!("第{}章已有待审稿，未覆盖；请先处理审批队列", num));
-                continue;
-            }
-            // 锁内 check：取消/依赖不满足时不落稿
-            if let Err(e) = files::write_ai_file_checked(
-                db,
-                book_id,
-                molan_core::db::REVIEW_GROUP,
-                &fname,
-                &body,
-                &check,
-            ) {
-                skipped.push(format!("第{}章待审落盘失败：{}", num, e));
-                continue;
-            }
-            // 队列登记失败必须报错：吞掉会让「文件已写但审批队列没有」，
-            // 作者在审批界面看不到这篇稿。
-            if let Err(e) = super::register_review_queue(db, book_id, &fname, &body) {
-                skipped.push(format!("第{}章文件已写入，但审批队列登记失败：{}", num, e));
-            }
-            let _ = molan_core::chapter_state::record_save(
-                db,
-                book_id,
-                num,
-                molan_core::db::REVIEW_GROUP,
-                &molan_core::continuity::content_hash(&body),
-            );
-            saved.push(format!("{} / {}", molan_core::db::REVIEW_GROUP, fname));
-        }
-    }
-    Ok((saved, skipped))
-}
+/// 聊天产出落盘（F07 / 契约 C）：实现搬至 chat_save.rs（为手动线腾行预算），语义不变。
+pub(crate) use chat_save::auto_save_chat_output_checked;
 
 /// 按预算截取，但**不静默**：返回 (截取后文本, 被省略的字符数)。
 /// 调用方必须把省略量显式告知模型，避免"关键内容被悄悄截掉仍宣称已核对"。
@@ -1575,6 +1466,30 @@ pub async fn dispatch_stream(
         "auto_write_last_task" => return auto_write::auto_write_last_task(st, cmd, args, tx).await,
         // Agent 对话（工具循环，独立于 chat_stream）
         "agent_turn" => return agent_loop::agent_turn(st, cmd, args, tx).await,
+        // ============ 手动线（作者逐章确认）：单章正文起草 + 细纲确认 ============
+        "draft_chapter" => return chapter_service::draft_chapter_stream(st, cmd, args, tx).await,
+        "confirm_outline" => {
+            let book_id = s("bookId");
+            if book_id.is_empty() {
+                return Err(anyhow!("缺少 bookId"));
+            }
+            let ch = a("ch").as_i64().unwrap_or(0);
+            let Some(name) = stage_context::target_outline_name(db, &book_id, ch) else {
+                return Err(anyhow!("未找到第{}章的细纲文件", ch));
+            };
+            let exp = s("expectedHash");
+            Ok(Some(molan_core::outline_confirm::confirm(
+                db,
+                &book_id,
+                ch,
+                &name,
+                if exp.trim().is_empty() {
+                    None
+                } else {
+                    Some(exp.trim())
+                },
+            )?))
+        }
         // ============ 多智能体分工 ============
         "get_agent_profiles" => {
             let (channels, active_id) = molan_llm::all_settings(db);
@@ -1653,7 +1568,9 @@ pub(crate) use auto_write::post_approved_chapter;
 pub(crate) mod agent_loop;
 mod agent_tools;
 pub(crate) mod chapter_review;
+pub(crate) mod chapter_service;
 pub(crate) mod chat;
+mod chat_save;
 mod decompose;
 pub(crate) mod fallback;
 pub(crate) mod skill_plan;

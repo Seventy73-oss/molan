@@ -593,12 +593,15 @@ pub async fn dispatch(
             );
             let mut state =
                 molan_core::pipeline::derive_state_with_memory(db, &book_id, &tree, &queue);
+            // 手动线标注：outlineStatus / next 收敛 outline_confirm / outline blockers
+            molan_core::outline_confirm::annotate(db, &book_id, &mut state);
             state["bookId"] = json!(book_id);
             let next = state["next"].clone();
-            // F4 收尾：blockers 非空 = 章节记忆未同步，预览不得宣称「已定稿章节记忆」
+            // F4 收尾：blockers 含 memory 项 = 章节记忆未同步，预览不得宣称「已定稿章节记忆」
+            // （annotate 之后 blockers 还可能有 outline 项，必须按 type 过滤，不能只看非空）
             let memory_blocked = state["blockers"]
                 .as_array()
-                .map(|b| !b.is_empty())
+                .map(|b| b.iter().any(|x| x["type"] == "memory"))
                 .unwrap_or(false);
             state["nextContext"] =
                 stream::stage_context::preview(db, &book_id, &next, memory_blocked);

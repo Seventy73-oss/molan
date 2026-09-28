@@ -81,36 +81,25 @@ impl Drop for AgentGuard {
     }
 }
 
-/// dispatch_stream 入口（st 仅作 db 载体；核心逻辑在 run_agent_turn，便于直测）。
+/// dispatch_stream 入口（st 提供 root/记忆补发；核心逻辑在 run_agent_turn，便于直测）。
 pub(crate) async fn agent_turn(
     st: &Arc<super::super::AppState>,
     _cmd: &str,
     args: &Value,
     tx: &tokio::sync::mpsc::Sender<String>,
 ) -> Result<Option<Value>> {
-    run_agent_turn(&st.db, args, tx).await
-}
-
-fn agent_system_prompt(db: &Db, book_id: &str) -> String {
-    let meta = db
-        .q_json(
-            "SELECT title, genre FROM books WHERE id=?1",
-            &[&book_id as &dyn rusqlite::ToSql],
-        )
-        .unwrap_or_default();
-    let title = meta
-        .first()
-        .and_then(|r| r["title"].as_str())
-        .unwrap_or("未命名");
-    let genre = meta
-        .first()
-        .and_then(|r| r["genre"].as_str())
-        .filter(|g| !g.is_empty())
-        .unwrap_or("未设定");
-    format!(
-        "你是墨澜工坊的创作 Agent，在书《{}》（题材：{}）范围内工作。\n你有工具可查询书的真实状态与文件、创建变更提案；工具结果是唯一事实来源，不得虚构文件内容、章节状态或回执。\n行为准则：\n1) 行动前先用 get_pipeline_state / scan_book_tree 查状态，用 get_chapter_context 查前文记忆；\n2) 正文与细纲的创作、定稿由作者通过写作流程与审批队列完成；你只做分析、规划与提案（create_change_proposal 产生 pending 提案，作者接受才生效），绝不声称已写入或已批准；\n3) 引用文件时给出 group/name 与关键原文，不确定就明说；\n4) 用与作者相同的语言回答，简洁、面向下一步行动。",
-        title, genre
-    )
+    let book = args
+        .get("bookId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let r = run_agent_turn(&st.db, args, tx).await;
+    // 手动线收尾：对话内定稿的章由审批 saga 预置 memory_job=pending，这里补发真实抽取
+    // （幂等 + 在飞去重；按钮路径的 approve_chapter 自带 spawn，不依赖本 sweep）。
+    if r.is_ok() && !book.is_empty() {
+        super::chapter_service::sweep_pending_memory(st, &book).await;
+    }
+    r
 }
 
 /// 上游是否明示不支持 tools（400/参数错误 + tool 关键词）。判定保守：
@@ -119,15 +108,6 @@ fn looks_tools_unsupported(e: &anyhow::Error) -> bool {
     let m = e.to_string().to_lowercase();
     (m.contains("400") || m.contains("bad request") || m.contains("invalid_request_error"))
         && (m.contains("tool") || m.contains("function calling"))
-}
-
-fn sanitize(api_key: &str, e: &anyhow::Error) -> String {
-    let msg = e.to_string();
-    if api_key.len() >= 8 && msg.contains(api_key) {
-        msg.replace(api_key, "***")
-    } else {
-        msg
-    }
 }
 
 pub(crate) async fn run_agent_turn(
@@ -284,7 +264,7 @@ pub(crate) async fn run_agent_turn(
     }));
 
     // system + 历史（近16条，越近越完整）+ 本条
-    let sys = agent_system_prompt(db, &book_id);
+    let sys = agent_tools::system_prompt(db, &book_id);
     let mut msgs: Vec<Value> = vec![json!({"role": "system", "content": sys})];
     let hist_rows = db
         .q_json(
@@ -442,19 +422,27 @@ pub(crate) async fn run_agent_turn(
                     .unwrap_or_else(|_| json!({}));
                     cx.ev(json!({"type":"tool","callId":call_id,"name":fname,"status":"running"}))
                         .await;
-                    let outcome = agent_tools::dispatch_tool(db, &book_id, &fname, &fargs);
+                    let outcome = agent_tools::dispatch_tool_io(
+                        db, &book_id, &fname, &fargs, &cancel, tx, &channel,
+                    )
+                    .await;
                     let (payload, ev_status, summary) = match &outcome {
                         Ok(v) => (v.clone(), "ok", agent_tools::tool_summary(v)),
                         Err(e) => (
-                            json!({"error": sanitize(&api_key, e)}),
+                            json!({"error": agent_tools::sanitize(&api_key, e)}),
                             "error",
-                            agent_tools::tool_summary(&json!({"error": sanitize(&api_key, e)})),
+                            agent_tools::tool_summary(
+                                &json!({"error": agent_tools::sanitize(&api_key, e)}),
+                            ),
                         ),
                     };
-                    steps.push(
-                        json!({"type":"tool","name":fname,"status":ev_status,"summary":summary}),
-                    );
-                    cx.ev(json!({"type":"tool","callId":call_id,"name":fname,"status":ev_status,"summary":summary})).await;
+                    // M2：结构化工件（前端确认卡凭证）随事件下发并持久化进 steps_json
+                    let artifact = agent_tools::artifact_of(&fname, &payload);
+                    steps.push(json!({
+                        "type":"tool","callId":call_id,"name":fname,
+                        "status":ev_status,"summary":summary,"artifact":artifact,
+                    }));
+                    cx.ev(json!({"type":"tool","callId":call_id,"name":fname,"status":ev_status,"summary":summary,"artifact":artifact})).await;
                     let content_str = agent_tools::truncate_chars(
                         &payload.to_string(),
                         agent_tools::MAX_RESULT_CHARS,
@@ -521,7 +509,7 @@ pub(crate) async fn run_agent_turn(
                     continue;
                 }
                 status = "error";
-                err_text = sanitize(&api_key, &e);
+                err_text = agent_tools::sanitize(&api_key, &e);
                 break;
             }
         }

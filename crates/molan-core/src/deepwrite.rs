@@ -385,7 +385,12 @@ pub fn accept_proposal(db: &Db, book_id: &str, id: &str) -> Result<Value> {
     if changed != 1 {
         bail!("提案状态提交失败：文件已写入但状态未翻转，请从版本历史核查");
     }
-    Ok(json!({"ok":true,"id":id,"status":"accepted","bookId":book_id,"group":group,"name":name}))
+    // appliedHash：实际落盘内容（=proposed）的指纹。手动线前端用它作 confirm_outline 的
+    // expectedHash（接受→确认一步链，绑定作者刚接受的那一版），不在客户端算 hash。
+    Ok(json!({
+        "ok":true,"id":id,"status":"accepted","bookId":book_id,"group":group,"name":name,
+        "appliedHash": crate::continuity::content_hash(proposed),
+    }))
 }
 
 pub fn reject_proposal(db: &Db, book_id: &str, id: &str, reason: &str) -> Result<Value> {

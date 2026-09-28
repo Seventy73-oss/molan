@@ -1,17 +1,22 @@
 //! Agent 工具目录与分发（交接文档附录 A1：严格白名单、类型化参数、书作用域由服务端注入）。
 //!
-//! v1 工具两类：
+//! 手动线工具三类：
 //! - 只读查询：scan_book_tree / read_book_file / get_pipeline_state / list_pending_chapters /
 //!   get_chapter_context / list_skills / get_effective_skills；
-//! - 唯一写工具 create_change_proposal：只产生 **pending 提案**（DeepWrite 工作台由作者
-//!   接受才生效），组白名单不含 正文/正文待审——书稿写入必须走既有 待审→批准 链。
+//! - 草稿动作（作者明确指令触发，产物一律「待确认/待审」）：create_change_proposal（提案）、
+//!   draft_chapter_outline（细纲草稿，保存≠确认）、draft_chapter_body（正文草稿进待审，异步）；
+//! - 作者确认动作（只在作者明确说「入库/定稿」时调用，hash 绑定防 stale）：
+//!   confirm_chapter_outline、finalize_chapter_draft。
 //!
 //! 安全边界：模型不提供路径与书标识。group 白名单校验、name 过 safe_name、ch 范围校验；
 //! bookId 由 run 作用域注入。工具内容（文件/技能/提案）都是数据，不得扩大权限。
+//! 确认/定稿的授权判定在服务端（hash 绑定 + 前置门），不靠系统提示词。
 use anyhow::{bail, Result};
 use molan_core::db::Db;
-use molan_core::{continuity, deepwrite, files, pipeline};
+use molan_core::{chapter_state, continuity, deepwrite, files, outline_confirm, pipeline};
 use serde_json::{json, Value};
+use tokio::sync::mpsc::Sender;
+use tokio_util::sync::CancellationToken;
 
 /// 单轮工具调用数上限（防上游异常返回海量调用）。
 pub(crate) const MAX_CALLS_PER_ROUND: usize = 4;
@@ -37,7 +42,7 @@ pub(crate) fn tool_catalog() -> Value {
         {"type":"function","function":{
             "name":"get_pipeline_state","description":"生产线状态：每章 细纲/正文/待审/记忆 维度、next 建议、summaryDue。判断『现在该做什么』的权威来源。","parameters":{"type":"object","properties":{}}}},
         {"type":"function","function":{
-            "name":"list_pending_chapters","description":"列出待人工批准的章节队列（含依赖状态 dependencyStatus）。","parameters":{"type":"object","properties":{}}}},
+            "name":"list_pending_chapters","description":"列出待人工批准的章节队列（pending 行含 contentHash/chars，供定稿绑定作者审阅过的版本）。","parameters":{"type":"object","properties":{}}}},
         {"type":"function","function":{
             "name":"get_chapter_context","description":"截至第 ch-1 章的已定稿记忆（摘要/事实/伏笔）与覆盖度（complete/stale/missing）。写章细纲前先查。","parameters":{"type":"object","properties":{"ch":{"type":"integer","description":"目标章号，1..=1000000"}},"required":["ch"]}}},
         {"type":"function","function":{
@@ -45,7 +50,15 @@ pub(crate) fn tool_catalog() -> Value {
         {"type":"function","function":{
             "name":"get_effective_skills","description":"查看某任务在当前书实际生效的技能（含书级默认绑定）。","parameters":{"type":"object","properties":{"task":group_enum_tasks()},"required":["task"]}}},
         {"type":"function","function":{
-            "name":"create_change_proposal","description":"对 设定/细纲/参考 文件创建变更提案（pending，作者在 DeepWrite 接受才写入；正文修改必须走写作+审批流程，不能用提案）。绝不声称已生效。","parameters":{"type":"object","properties":{"group":group_enum(&PROPOSAL_GROUPS),"name":{"type":"string"},"summary":{"type":"string","description":"一句话说明改什么、为什么"},"proposedContent":{"type":"string","description":"提议的完整新文件内容"}},"required":["group","name","summary","proposedContent"]}}}
+            "name":"create_change_proposal","description":"对 设定/细纲/参考 文件创建变更提案（pending，作者在提案卡/DeepWrite 接受才写入；正文修改必须走写作+审批流程，不能用提案）。绝不声称已生效。","parameters":{"type":"object","properties":{"group":group_enum(&PROPOSAL_GROUPS),"name":{"type":"string"},"summary":{"type":"string","description":"一句话说明改什么、为什么"},"proposedContent":{"type":"string","description":"提议的完整新文件内容"}},"required":["group","name","summary","proposedContent"]}}},
+        {"type":"function","function":{
+            "name":"draft_chapter_outline","description":"把起草好的第 ch 章细纲保存为草稿文件（仅新建；该章已有细纲时拒绝——修改既有细纲必须改用 create_change_proposal）。保存≠确认：作者确认入库前不能起草正文。","parameters":{"type":"object","properties":{"ch":{"type":"integer","description":"目标章号"},"content":{"type":"string","description":"细纲全文（Markdown；含本章目标/场景顺序/信息差/结尾状态）"}},"required":["ch","content"]}}},
+        {"type":"function","function":{
+            "name":"confirm_chapter_outline","description":"仅当作者明确表示「这个细纲可以，入库/确认」时调用：把该章细纲当前内容绑定为已确认版本，返回真实回执。expectedHash 传作者看过那一版的 hash（来自 read_book_file / draft_chapter_outline 回执）；期间被改则拒绝。绝不代替作者决定确认。","parameters":{"type":"object","properties":{"ch":{"type":"integer"},"expectedHash":{"type":"string","description":"作者看过版本的 contentHash（可省略=绑定当前内容）"}},"required":["ch"]}}},
+        {"type":"function","function":{
+            "name":"draft_chapter_body","description":"仅当作者明确要求写正文时调用：前置检查（细纲已确认且未失效、无既有稿件、前序记忆无阻塞、上一章已定稿）通过后生成第 ch 章正文草稿，自动去AI味并做剧情审核，落「正文待审」+审批队列。草稿≠定稿。耗时较长。","parameters":{"type":"object","properties":{"ch":{"type":"integer"},"instruction":{"type":"string","description":"本轮特别要求（可选）"}},"required":["ch"]}}},
+        {"type":"function","function":{
+            "name":"finalize_chapter_draft","description":"仅当作者明确表示「这个版本定稿」时调用：按 expectedHash 绑定作者审阅过的待审版本执行定稿（与审批按钮同一核心动作），故事记忆自动排队同步。hash 不匹配即拒绝。绝不代替作者决定定稿。","parameters":{"type":"object","properties":{"ch":{"type":"integer"},"expectedHash":{"type":"string","description":"必填：作者审阅版本的 contentHash（来自 draft_chapter_body 回执或 list_pending_chapters）"}},"required":["ch","expectedHash"]}}}
     ])
 }
 
@@ -119,6 +132,10 @@ pub(crate) fn dispatch_tool(db: &Db, book_id: &str, name: &str, args: &Value) ->
         "read_book_file" => {
             let group = validate_group(arg_str(args, "group")?, &READ_GROUPS)?;
             let fname = validate_name(arg_str(args, "name")?)?;
+            // aiOff 是作者侧硬边界：对模型隐藏的文件连读取都要拒绝（B0 契约 §8.2）
+            if files::file_flag(db, book_id, &group, &fname, "aiOff") {
+                bail!("文件已设为 AI 不可见（aiOff）：{}/{}", group, fname);
+            }
             let content = files::read_file(db, book_id, &group, &fname)
                 .ok_or_else(|| anyhow::anyhow!("文件不存在：{}/{}", group, fname))?;
             Ok(json!({
@@ -137,15 +154,34 @@ pub(crate) fn dispatch_tool(db: &Db, book_id: &str, name: &str, args: &Value) ->
                 )
                 .unwrap_or_default(),
             );
-            Ok(pipeline::derive_state_with_memory(db, book_id, &tree, &queue))
+            let mut state = pipeline::derive_state_with_memory(db, book_id, &tree, &queue);
+            // 手动线标注：outlineStatus / outline_confirm 收敛 / outline blockers（与 IPC 同源）
+            outline_confirm::annotate(db, book_id, &mut state);
+            Ok(state)
         }
-        "list_pending_chapters" => Ok(Value::Array(
-            db.q_json(
-                "SELECT ch, review_file, status, created_at FROM pending_chapter WHERE book_id=?1 ORDER BY ch",
-                &[&book_id as &dyn rusqlite::ToSql],
-            )
-            .unwrap_or_default(),
-        )),
+        "list_pending_chapters" => {
+            let rows = db
+                .q_json(
+                    "SELECT ch, review_file, status, created_at FROM pending_chapter WHERE book_id=?1 ORDER BY ch",
+                    &[&book_id as &dyn rusqlite::ToSql],
+                )
+                .unwrap_or_default();
+            // pending 行补 contentHash/chars：finalize_chapter_draft 必须绑定作者审阅过的版本
+            let mut out = Vec::with_capacity(rows.len());
+            for mut r in rows {
+                let fname = r["reviewFile"].as_str().unwrap_or("");
+                if r["status"].as_str() == Some("pending") && !fname.is_empty() {
+                    if let Some(text) =
+                        files::read_file(db, book_id, molan_core::db::REVIEW_GROUP, fname)
+                    {
+                        r["contentHash"] = json!(continuity::content_hash(&text));
+                        r["chars"] = json!(text.chars().count());
+                    }
+                }
+                out.push(r);
+            }
+            Ok(Value::Array(out))
+        }
         "get_chapter_context" => {
             let ch = validate_ch(args.get("ch").unwrap_or(&Value::Null))?;
             let mut ctx = continuity::chapter_context(db, book_id, ch)?;
@@ -181,11 +217,153 @@ pub(crate) fn dispatch_tool(db: &Db, book_id: &str, name: &str, args: &Value) ->
             )?;
             Ok(json!({
                 "proposalId": p["id"], "status": p["status"],
-                "note": "提案已创建，等待作者在 DeepWrite 工作台接受；未写入任何文件",
+                "group": group, "name": fname, "summary": summary,
+                "chars": content.chars().count(),
+                "note": "提案已创建（pending），等待作者接受；未写入任何文件",
             }))
+        }
+        "draft_chapter_outline" => {
+            let ch = validate_ch(args.get("ch").unwrap_or(&Value::Null))?;
+            let content = arg_str(args, "content")?;
+            if content.chars().count() < 30 {
+                bail!("细纲内容过短（<30字），不足以作为章细纲");
+            }
+            if content.chars().count() > 20_000 {
+                bail!("细纲内容超限（>20000字）");
+            }
+            // 已有细纲（任意命名）不覆盖：修改既有细纲必须走提案（作者接受才生效，CAS 保护）
+            if let Some(existing) = super::stage_context::target_outline_name(db, book_id, ch) {
+                bail!(
+                    "第{}章已有细纲（{}）：修改既有细纲请用 create_change_proposal，不覆盖",
+                    ch,
+                    existing
+                );
+            }
+            let fname = format!("细纲_第{}章.md", ch);
+            files::write_ai_file(db, book_id, "细纲", &fname, content)?;
+            let hash = continuity::content_hash(content);
+            let _ = chapter_state::record_outline(db, book_id, ch, &hash);
+            Ok(json!({
+                "ok": true, "kind": "outline_saved", "ch": ch, "name": fname,
+                "hash": hash, "chars": content.chars().count(), "status": "saved",
+                "note": "细纲已保存为草稿（未确认）；作者确认入库后才能起草正文",
+            }))
+        }
+        "confirm_chapter_outline" => {
+            let ch = validate_ch(args.get("ch").unwrap_or(&Value::Null))?;
+            let Some(oname) = super::stage_context::target_outline_name(db, book_id, ch) else {
+                bail!("未找到第{}章的细纲文件，无法确认入库", ch);
+            };
+            let exp = args
+                .get("expectedHash")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let mut r = outline_confirm::confirm(db, book_id, ch, &oname, exp)?;
+            r["kind"] = json!("outline_confirmed");
+            r["status"] = json!("confirmed");
+            Ok(r)
+        }
+        "finalize_chapter_draft" => {
+            let ch = validate_ch(args.get("ch").unwrap_or(&Value::Null))?;
+            // expectedHash 工具路径必填：定稿必须绑定作者审阅过的那一版（§5.5）
+            let exp = arg_str(args, "expectedHash")?;
+            super::chapter_service::finalize_draft(db, book_id, ch, exp)
         }
         _ => bail!("未知工具：{}", name),
     }
+}
+
+/// 异步分发入口（agent_loop 唯一调用点）：draft_chapter_body 走单章起草服务（LLM，需
+/// 取消令牌与进度通道），其余工具落回同步 dispatch_tool。参数上限与书校验同 sync 路径。
+pub(crate) async fn dispatch_tool_io(
+    db: &Db,
+    book_id: &str,
+    name: &str,
+    args: &Value,
+    cancel: &CancellationToken,
+    tx: &Sender<String>,
+    channel: &str,
+) -> Result<Value> {
+    if name == "draft_chapter_body" {
+        if serde_json::to_string(args).unwrap_or_default().len() > MAX_ARG_BYTES {
+            bail!("工具参数超限（>{}字节）", MAX_ARG_BYTES);
+        }
+        if !files::valid_book_id(db, book_id) {
+            bail!("书籍不存在或已删除");
+        }
+        let ch = validate_ch(args.get("ch").unwrap_or(&Value::Null))?;
+        let instruction = args
+            .get("instruction")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        // root 供 prompts/文风档案解析：data_dir = root/data（main.rs 构造恒等式）
+        let root = db.data_dir.parent().unwrap_or(&db.data_dir);
+        let emit = super::chapter_service::Emit::new(tx, channel);
+        return super::chapter_service::draft_chapter(
+            db,
+            root,
+            book_id,
+            ch,
+            instruction,
+            cancel.clone(),
+            &emit,
+        )
+        .await;
+    }
+    dispatch_tool(db, book_id, name, args)
+}
+
+/// 结构化产物（工件）：写类工具成功时从回执提取，随 tool 事件下发并持久化进 steps_json，
+/// 前端按 kind 渲染确认卡（提案/细纲/草稿/定稿），历史恢复同一形状。读类工具与错误 → Null。
+pub(crate) fn artifact_of(name: &str, payload: &Value) -> Value {
+    if payload.get("error").is_some() {
+        return Value::Null;
+    }
+    match name {
+        "create_change_proposal" => json!({
+            "kind": "proposal", "proposalId": payload["proposalId"],
+            "group": payload["group"], "name": payload["name"], "summary": payload["summary"],
+        }),
+        "draft_chapter_outline"
+        | "confirm_chapter_outline"
+        | "draft_chapter_body"
+        | "finalize_chapter_draft" => payload.clone(),
+        _ => Value::Null,
+    }
+}
+
+/// 脱敏：上游错误文本里若带 API key 必须打码（agent_loop 与工具错误共用）。
+pub(crate) fn sanitize(api_key: &str, e: &anyhow::Error) -> String {
+    let msg = e.to_string();
+    if api_key.len() >= 8 && msg.contains(api_key) {
+        msg.replace(api_key, "***")
+    } else {
+        msg
+    }
+}
+
+/// 手动线系统提示（从 agent_loop 迁入并升级）：能力=工具目录，授权=作者明确指令+服务端门。
+pub(crate) fn system_prompt(db: &Db, book_id: &str) -> String {
+    let meta = db
+        .q_json(
+            "SELECT title, genre FROM books WHERE id=?1",
+            &[&book_id as &dyn rusqlite::ToSql],
+        )
+        .unwrap_or_default();
+    let title = meta
+        .first()
+        .and_then(|r| r["title"].as_str())
+        .unwrap_or("未命名");
+    let genre = meta
+        .first()
+        .and_then(|r| r["genre"].as_str())
+        .filter(|g| !g.is_empty())
+        .unwrap_or("未设定");
+    format!(
+        "你是墨澜工坊的创作 Agent，在书《{}》（题材：{}）范围内按「手动线」工作：每一步写入都由作者确认后推进。\n工具结果是唯一事实来源；没有工具回执，绝不说「已保存/已确认/已定稿」。\n流程与工具：\n1) 行动前先 get_pipeline_state 查状态（outlineStatus/next/blockers）；需要前文事实用 get_chapter_context；\n2) 建档/设定/规划/参考：create_change_proposal 提案，作者接受才生效；\n3) 作者要章细纲：你起草并 draft_chapter_outline 保存（保存≠确认）；修改既有细纲用 create_change_proposal；\n4) 作者明确说「细纲可以，入库/确认」→ confirm_chapter_outline（expectedHash 传作者看过那一版的 hash）；含糊的「可以」只在唯一待确认对象时绑定；\n5) 作者明确要求写正文 → draft_chapter_body（前置：细纲已确认；产物进「正文待审」，不是定稿）；\n6) 作者明确说「定稿」→ finalize_chapter_draft（expectedHash 必填，来自草稿回执或 list_pending_chapters）；定稿后记忆自动排队，用 get_pipeline_state 如实汇报，绝不声称记忆已成功除非状态是 valid；\n7) 一次只推进一章；作者说停就停；不跳章、不代替作者确认。\n引用文件给 group/name 与关键原文，不确定就明说；用与作者相同的语言回答，简洁、面向下一步行动。",
+        title, genre
+    )
 }
 
 /// 工具事件的公开摘要（脱敏：只留结构与关键字段，不回显全文）。
@@ -219,7 +397,16 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names.len(), 8);
+        // 手动线 12 工具：7 读 + 提案 + 细纲草稿/确认 + 正文草稿（仅异步入口）+ 定稿
+        assert_eq!(names.len(), 12);
+        for n in [
+            "draft_chapter_outline",
+            "confirm_chapter_outline",
+            "draft_chapter_body",
+            "finalize_chapter_draft",
+        ] {
+            assert!(names.contains(&n.to_string()), "目录缺少 {}", n);
+        }
         let err = dispatch_tool(&db, &book, "definitely_not_a_tool", &json!({})).unwrap_err();
         assert!(err.to_string().contains("未知工具"));
         assert!(names.contains(&"scan_book_tree".to_string()));
@@ -335,5 +522,150 @@ mod tests {
         )
         .unwrap();
         assert!(eff.is_array());
+    }
+
+    // ---------- 手动线同步工具 ----------
+
+    #[test]
+    fn draft_outline_saves_unconfirmed_and_blocks_overwrite() {
+        let (_d, db, book) = fixture();
+        let content = "第1章细纲：目标、冲突、场景顺序、章末钩子。".repeat(2);
+        let out = dispatch_tool(
+            &db,
+            &book,
+            "draft_chapter_outline",
+            &json!({"ch":1,"content":content}),
+        )
+        .unwrap();
+        assert_eq!(out["kind"], "outline_saved");
+        assert_eq!(out["status"], "saved");
+        assert_eq!(out["name"], "细纲_第1章.md");
+        // 保存≠确认：outlineStatus 必须是 saved 而非 confirmed
+        let st = outline_confirm::status_for(&db, &book, 1, "细纲_第1章.md");
+        assert_eq!(st["status"], "saved");
+        // 已有细纲不覆盖：再存同章必须被拒（引导走提案）
+        let again = dispatch_tool(
+            &db,
+            &book,
+            "draft_chapter_outline",
+            &json!({"ch":1,"content":"另一版"}),
+        );
+        assert!(again.is_err());
+        // 过短拒绝
+        assert!(dispatch_tool(
+            &db,
+            &book,
+            "draft_chapter_outline",
+            &json!({"ch":2,"content":"太短"}),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn confirm_outline_binds_hash_and_rejects_stale_expected() {
+        let (_d, db, book) = fixture();
+        let content = "第1章细纲：目标、冲突、场景顺序、章末钩子。".repeat(2);
+        dispatch_tool(
+            &db,
+            &book,
+            "draft_chapter_outline",
+            &json!({"ch":1,"content":content}),
+        )
+        .unwrap();
+        let st = outline_confirm::status_for(&db, &book, 1, "细纲_第1章.md");
+        let h = st["hash"].as_str().unwrap().to_string();
+        // 错误 expectedHash → 拒绝（作者看的不是这一版）
+        assert!(dispatch_tool(
+            &db,
+            &book,
+            "confirm_chapter_outline",
+            &json!({"ch":1,"expectedHash":"deadbeef"}),
+        )
+        .is_err());
+        // 正确 hash → confirmed 回执
+        let r = dispatch_tool(
+            &db,
+            &book,
+            "confirm_chapter_outline",
+            &json!({"ch":1,"expectedHash":h}),
+        )
+        .unwrap();
+        assert_eq!(r["kind"], "outline_confirmed");
+        assert_eq!(r["status"], "confirmed");
+        assert_eq!(
+            outline_confirm::status_for(&db, &book, 1, "细纲_第1章.md")["status"],
+            "confirmed"
+        );
+    }
+
+    #[test]
+    fn read_book_file_respects_ai_off() {
+        let (_d, db, book) = fixture();
+        files::write_file(&db, &book, "设定", "世界观.md", "修真体系").unwrap();
+        // aiOff 后模型不得读取（B0 契约 §8.2）
+        db.exec(
+            "INSERT INTO settings(key,value) VALUES(?1,?2)",
+            &[
+                &format!("file_flags__{}", book),
+                &json!({"设定/世界观.md":{"aiOff":true}}).to_string(),
+            ],
+        )
+        .unwrap();
+        let r = dispatch_tool(
+            &db,
+            &book,
+            "read_book_file",
+            &json!({"group":"设定","name":"世界观.md"}),
+        );
+        assert!(r.is_err(), "aiOff 文件必须拒绝读取");
+    }
+
+    #[test]
+    fn finalize_requires_expected_hash_and_no_pending_is_error() {
+        let (_d, db, book) = fixture();
+        // expectedHash 必填
+        assert!(dispatch_tool(&db, &book, "finalize_chapter_draft", &json!({"ch":1})).is_err());
+        // 无待审稿 → 明确错误（不静默成功）
+        let e = dispatch_tool(
+            &db,
+            &book,
+            "finalize_chapter_draft",
+            &json!({"ch":1,"expectedHash":"x"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("没有待审稿"), "{}", e);
+    }
+
+    #[test]
+    fn artifact_of_shapes_match_contract() {
+        let p = artifact_of(
+            "create_change_proposal",
+            &json!({"proposalId":"pid","group":"细纲","name":"n","summary":"s"}),
+        );
+        assert_eq!(p["kind"], "proposal");
+        assert_eq!(p["proposalId"], "pid");
+        // 错误回执不产生工件
+        assert!(artifact_of("create_change_proposal", &json!({"error":"x"})).is_null());
+        // 读类工具无工件
+        assert!(artifact_of("scan_book_tree", &json!({"ok":true})).is_null());
+        // 写类工具回执原样带 kind
+        let d = artifact_of("draft_chapter_body", &json!({"kind":"body_draft","ch":3}));
+        assert_eq!(d["kind"], "body_draft");
+    }
+
+    #[test]
+    fn list_pending_includes_content_hash() {
+        let (_d, db, book) = fixture();
+        let body = "第1章正文待审内容。".repeat(20);
+        files::write_file(&db, &book, molan_core::db::REVIEW_GROUP, "第1章.md", &body).unwrap();
+        crate::handlers::register_review_queue(&db, &book, "第1章.md", &body).unwrap();
+        let rows = dispatch_tool(&db, &book, "list_pending_chapters", &json!({})).unwrap();
+        let r0 = &rows.as_array().unwrap()[0];
+        assert_eq!(
+            r0["contentHash"].as_str().unwrap(),
+            continuity::content_hash(&body)
+        );
+        assert!(r0["chars"].as_i64().unwrap() > 0);
     }
 }
