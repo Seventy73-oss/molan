@@ -649,7 +649,7 @@ pub async fn dispatch(
                     outline = o.chars().take(200).collect();
                 }
                 // 依赖账本状态（null=未登记）：stale 表示父稿已变，批准前必须重审
-                let dep = db
+                let dep: Option<String> = db
                     .q_json(
                         "SELECT status FROM draft_dependency WHERE book_id=?1 AND ch=?2",
                         &[
@@ -658,10 +658,7 @@ pub async fn dispatch(
                         ],
                     )
                     .ok()
-                    .and_then(|v| {
-                        v.first()
-                            .and_then(|r| r["status"].as_str().map(str::to_string))
-                    });
+                    .and_then(|v| v.first()?.get("status")?.as_str().map(str::to_string));
                 out.push(json!({
                     "ch": ch, "name": name,
                     "words": content.chars().count(),
@@ -1960,8 +1957,9 @@ pub async fn dispatch(
         }
         // ---------- 通用桩 ----------
         "abort_chat" => {
-            // 取消长任务（拆解等）：requestId 放进取消集合，任务在下个分段边界消费
+            // 取消长任务：requestId 放进取消集合，任务在下个分段边界消费
             stream::request_abort(&s("requestId"));
+            stream::agent_loop::abort_by_args(args); // 无 requestId 的 agent 会话按 sessionId 兜底
             Ok(Some(json!({"ok": true})))
         }
         "set_skill_script_authorization" => Ok(Some(json!({"ok": true}))),

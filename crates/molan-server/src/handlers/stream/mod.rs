@@ -1569,12 +1569,12 @@ pub async fn dispatch_stream(
     let s = |k: &str| a(k).as_str().unwrap_or("").to_string();
 
     match cmd {
-        // ============ 自动写作引擎 ============
+        // ============ 自动写作引擎（start/续跑断点/最近任务） ============
         "auto_write_start" => return auto_write::auto_write_start(st, cmd, args, tx).await,
-        // 续跑：从上次断点（current_ch+1）接着写
         "auto_write_resume" => return auto_write::auto_write_resume(st, cmd, args, tx).await,
-        // 最近任务（含历史 failed/interrupted，供面板展示与续跑）
         "auto_write_last_task" => return auto_write::auto_write_last_task(st, cmd, args, tx).await,
+        // Agent 对话（工具循环，独立于 chat_stream）
+        "agent_turn" => return agent_loop::agent_turn(st, cmd, args, tx).await,
         // ============ 多智能体分工 ============
         "get_agent_profiles" => {
             let (channels, active_id) = molan_llm::all_settings(db);
@@ -1619,11 +1619,9 @@ pub async fn dispatch_stream(
         "book_dl_get" => return sources::book_dl_get(st, cmd, args, tx).await,
         "auto_write_status" => return auto_write::auto_write_status(st, cmd, args, tx).await,
         "auto_write_stop" => return auto_write::auto_write_stop(st, cmd, args, tx).await,
-        // ============ 流式对话 ============
-        "chat_stream" => return chat::chat_stream(st, cmd, args, tx).await,
-        // ============ 风格蒸馏（流式） ============
+        "chat_stream" => return chat::chat_stream(st, cmd, args, tx).await, // 流式对话
         "distill_style_stream" | "redistill_book_style" => {
-            return decompose::distill_style_stream(st, cmd, args, tx).await
+            return decompose::distill_style_stream(st, cmd, args, tx).await; // 风格蒸馏（流式）
         }
         // ============ 风格样例（一次性） ============
         "gen_style_sample" => return decompose::gen_style_sample(st, cmd, args, tx).await,
@@ -1654,6 +1652,8 @@ pub use chat::request_abort;
 mod auto_write;
 // B: 按「实际批准章 + hash」事件化写入正式记忆（F 审批成功 / rebuild_memory 调用；幂等）
 pub(crate) use auto_write::post_approved_chapter;
+pub(crate) mod agent_loop;
+mod agent_tools;
 pub(crate) mod chat;
 mod decompose;
 pub(crate) mod fallback;

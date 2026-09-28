@@ -56,7 +56,7 @@ pub(super) fn allow_save(args: &Value, task: &str, mode: &str) -> bool {
 /// history, skipping only rows whose id equals `current_user_id`. The 4 most
 /// recent kept rows are capped at 4000 chars, older kept rows at 1500 chars;
 /// rows are never deduplicated by content.
-pub(super) fn history(rows: &[Value], current_user_id: &str) -> Vec<Value> {
+pub(crate) fn history(rows: &[Value], current_user_id: &str) -> Vec<Value> {
     let mut kept: Vec<Value> = Vec::new();
     let mut recent = 0usize;
     for row in rows {

@@ -583,7 +583,14 @@ pub async fn chat_completion_stream_opts(
         // mock 确定性工具协议：仅当调用方给了 tools 且最后一条 user 文本含
         // [call:<工具名>] 时，回一次该工具的 tool_call（id="mock-call-1"、arguments="{}"、
         // finish_reason="tool_calls"）；否则维持原有 mock 正文/JSON 行为。
-        if let Some(calls) = agent_transport::mock_tool_calls(&opts, user) {
+        // last_is_user 门槛：工具结果回灌后（末条是 tool 消息）回落正文分支，
+        // 使 mock 也能驱动「工具轮→文本轮」的多轮 Agent 循环测试。
+        let last_is_user = params
+            .messages
+            .last()
+            .is_some_and(|m| m["role"].as_str() == Some("user"));
+        if let Some(calls) = agent_transport::mock_tool_calls(&opts, user).filter(|_| last_is_user)
+        {
             let _ = tx.send(LlmEvent::ToolCalls(calls));
             let _ = tx.send(LlmEvent::Meta(None));
             return Ok(CompletionState::ToolCalls);
