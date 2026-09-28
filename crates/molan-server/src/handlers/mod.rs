@@ -595,7 +595,13 @@ pub async fn dispatch(
                 molan_core::pipeline::derive_state_with_memory(db, &book_id, &tree, &queue);
             state["bookId"] = json!(book_id);
             let next = state["next"].clone();
-            state["nextContext"] = stream::stage_context::preview(db, &book_id, &next);
+            // F4 收尾：blockers 非空 = 章节记忆未同步，预览不得宣称「已定稿章节记忆」
+            let memory_blocked = state["blockers"]
+                .as_array()
+                .map(|b| !b.is_empty())
+                .unwrap_or(false);
+            state["nextContext"] =
+                stream::stage_context::preview(db, &book_id, &next, memory_blocked);
             Ok(Some(state))
         }
         // ============ 审批流：AI 产出待审章节的人工接受/拒绝 ============

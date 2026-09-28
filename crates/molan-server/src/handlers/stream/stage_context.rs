@@ -79,7 +79,13 @@ pub(crate) fn append_target_outline(
 }
 
 /// 面板预览：下一步动作将自动携带的上下文清单（只列真实存在/必然注入的项）。
-pub(crate) fn preview(db: &molan_core::db::Db, book_id: &str, next: &Value) -> Value {
+/// memory_blocked=true（pipeline blockers 非空）时不得宣称「已定稿章节记忆」（F4 收尾）。
+pub(crate) fn preview(
+    db: &molan_core::db::Db,
+    book_id: &str,
+    next: &Value,
+    memory_blocked: bool,
+) -> Value {
     let tree = files::scan_tree(db, book_id);
     let has = |dir: &str, pred: &dyn Fn(&str) -> bool| -> Option<String> {
         tree.as_array()?
@@ -106,7 +112,12 @@ pub(crate) fn preview(db: &molan_core::db::Db, book_id: &str, next: &Value) -> V
     }
     let ch = next["chapter"].as_i64().unwrap_or(0);
     if ch > 1 {
-        out.push(json!({"label": "已定稿章节记忆（截至第N-1章）", "file": null}));
+        if memory_blocked {
+            // 记忆未同步/失败：如实标注降级来源，不谎称注入已定稿记忆
+            out.push(json!({"label": "原文结尾（降级：章节记忆未同步）", "file": null}));
+        } else {
+            out.push(json!({"label": "已定稿章节记忆（截至第N-1章）", "file": null}));
+        }
         out.push(json!({"label": "最近正文结尾（衔接锚点）", "file": null}));
     }
     if next["stage"].as_str() == Some("chapter_body") && ch > 0 {
@@ -178,7 +189,12 @@ mod tests {
     #[test]
     fn preview_lists_real_files_only() {
         let (_d, db, bid) = setup();
-        let p = preview(&db, &bid, &json!({"stage": "chapter_body", "chapter": 1}));
+        let p = preview(
+            &db,
+            &bid,
+            &json!({"stage": "chapter_body", "chapter": 1}),
+            false,
+        );
         let labels: Vec<String> = p
             .as_array()
             .unwrap()
@@ -191,5 +207,47 @@ mod tests {
             !labels.iter().any(|l| l.contains("已定稿")),
             "第1章无前章记忆"
         );
+    }
+
+    #[test]
+    fn preview_memory_blocked_never_claims_memory_label() {
+        let (_d, db, bid) = setup();
+        // 记忆被阻塞（failed/stale/pending）：不得宣称「已定稿章节记忆」，降级标注原文
+        let p = preview(
+            &db,
+            &bid,
+            &json!({"stage": "memory_fix", "chapter": 3}),
+            true,
+        );
+        let labels: Vec<String> = p
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["label"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !labels.iter().any(|l| l.contains("已定稿章节记忆")),
+            "记忆阻塞时不得谎称注入记忆: {:?}",
+            labels
+        );
+        assert!(labels.iter().any(|l| l.contains("降级")));
+    }
+
+    #[test]
+    fn preview_memory_ok_keeps_memory_label() {
+        let (_d, db, bid) = setup();
+        let p = preview(
+            &db,
+            &bid,
+            &json!({"stage": "chapter_outline", "chapter": 3}),
+            false,
+        );
+        let labels: Vec<String> = p
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["label"].as_str().unwrap().to_string())
+            .collect();
+        assert!(labels.iter().any(|l| l.contains("已定稿章节记忆")));
     }
 }

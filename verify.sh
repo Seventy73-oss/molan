@@ -11,8 +11,14 @@ cargo test --workspace
 echo "[verify] glue syntax"
 if command -v node >/dev/null 2>&1; then
   node --check crates/molan-server/src/glue.js
+  node --check crates/molan-server/src/pipeline_ui.js
+  node --check crates/molan-server/src/agent_ui.js
+  if [ -f ../production-flow/ui-check.cjs ]; then
+    echo "[verify] agent UI contract"
+    node ../production-flow/ui-check.cjs
+  fi
 else
-  echo "[verify] 无 node，跳过 glue 语法检查"
+  echo "[verify] 无 node，跳过 glue/UI 语法检查"
 fi
 echo "[verify] line budget"
 sh tools/check_line_budget.sh .

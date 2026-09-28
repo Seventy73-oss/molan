@@ -14,3 +14,7 @@ crates/molan-core/src/continuity.rs	1040
 crates/molan-llm/src/lib.rs	1210
 crates/molan-server/src/auth.rs	970
 crates/molan-server/src/handlers/stream/decompose.rs	1151
+# WAVE2（F1/F2/F4/F6 修复）：净增绝大部分为回归测试（F2/F4 6 项 + F1/F6 5 项及夹具）。
+# 抽测试到独立文件需搬动 ~920 行既有测试，diff 噪音大于收益，按本文件既有惯例登记。
+crates/molan-core/src/pipeline.rs	913
+crates/molan-server/src/handlers/stream/agent_loop.rs	1020

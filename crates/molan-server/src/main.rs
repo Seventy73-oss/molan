@@ -450,10 +450,11 @@ async fn static_handler(
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             let inject = format!(
-                "<script>window.__WX_BUILD__=\"{}\";{}</script><script>{}</script>",
+                "<script>window.__WX_BUILD__=\"{}\";{}</script><script>{}</script><script>{}</script>",
                 build_ts,
                 include_str!("glue.js"),
-                include_str!("pipeline_ui.js")
+                include_str!("pipeline_ui.js"),
+                include_str!("agent_ui.js")
             );
             let html = if !html.contains("__WRITERX_GLUE__") {
                 html.replacen("<head>", &format!("<head>{}", inject), 1)
