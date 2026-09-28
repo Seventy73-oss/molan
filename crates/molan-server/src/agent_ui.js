@@ -1,14 +1,9 @@
 // 创作助手运行视图（WAVE2 任务 B）——独立模块，挂在 window.__molanAgentUI。
 //
-// 注入方式（本文件不改 .rs，注册由 Lead 负责）：
-//   在 crates/molan-server/src/main.rs 的 include_str! 注入里追加一行：
-//     "<script>window.__WX_BUILD__=\"{}\";{}</script><script>{}</script>",
-//     build_ts,
-//     include_str!("glue.js"),
-//     include_str!("pipeline_ui.js"),
-//     include_str!("agent_ui.js")        // ← 新增
-//   必须排在 glue.js 之后（依赖 window.__TAURI_INTERNALS__）。
-//   修改注入脚本后需 `cargo build -p molan-server` 才生效（cargo test 不更新 exe）。
+// 注入方式：由 main.rs 的 include_str! 链注入，排在 glue.js / pipeline_ui.js 之后
+// （依赖 window.__TAURI_INTERNALS__）。修改注入脚本后需 cargo build -p molan-server 才生效。
+// ⚠️ 本文件会被内联进 HTML：任何注释/字符串里都绝不允许出现 script 闭合标签序列
+// （会把 script 标签提前闭合，整页源码外露）。verify.sh 有硬检查。
 //
 // 事件契约（来自 AUDIT-BACKEND.md §5.2 实测 + FRONTEND-AGENT-INTEGRATION.md §3/4）：
 //   POST /ipc/agent_turn { bookId, sessionId, requestId, message, onEvent:"__CHANNEL__:<id>" }

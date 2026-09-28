@@ -22,4 +22,10 @@ else
 fi
 echo "[verify] line budget"
 sh tools/check_line_budget.sh .
+echo "[verify] inline-script safety"
+# 内联进 HTML 的脚本绝不允许含 "</script"（会提前闭合 script 标签，整页源码外露）
+if grep -l '</script' crates/molan-server/src/glue.js crates/molan-server/src/pipeline_ui.js crates/molan-server/src/agent_ui.js 2>/dev/null; then
+  echo "[verify] FAIL: 注入脚本含 </script 序列"
+  exit 1
+fi
 echo "[verify] ALL GREEN"
