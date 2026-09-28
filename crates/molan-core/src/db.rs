@@ -62,6 +62,8 @@ impl Db {
         crate::facts::ensure_schema(&db)?;
         crate::ctx_manifest::ensure_schema(&db)?;
         crate::agent_run::ensure_schema(&db)?;
+        // 技能版本化回填：旧库既有行补 rev=1 与真实模板 hash（幂等）
+        crate::skill_rev::ensure_backfill(&db)?;
         // 启动自愈中断的审批 saga；失败不阻断启动（审批入口仍按 hash 判据自愈）
         if let Err(e) = crate::approval::recover_approvals(&db) {
             eprintln!("[molan-core] 审批 saga 恢复未完成：{}", e);
@@ -125,7 +127,9 @@ impl Db {
                 builtin_key TEXT,
                 usage_mode TEXT,
                 origin TEXT,
-                targets_json TEXT
+                targets_json TEXT,
+                rev INTEGER NOT NULL DEFAULT 1,
+                content_hash TEXT NOT NULL DEFAULT ''
             );",
         )?;
         conn.execute_batch(
@@ -219,6 +223,38 @@ impl Db {
                 )?;
             }
         }
+        // skills 版本化（附录 A4.1）：探测式补列，样板同 books.deleted_at。
+        // 旧库既有行 rev=1；content_hash 由 skill_rev::ensure_backfill 回填真实模板 hash。
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(skills)")?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if !cols.iter().any(|c| c == "rev") {
+                conn.execute_batch("ALTER TABLE skills ADD COLUMN rev INTEGER NOT NULL DEFAULT 1")?;
+            }
+            if !cols.iter().any(|c| c == "content_hash") {
+                conn.execute_batch(
+                    "ALTER TABLE skills ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+                )?;
+            }
+        }
+        // 技能版本历史：每次修改先落旧模板快照，再自增主行 rev（不可变审计）。
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS skill_revision (
+                skill_id TEXT NOT NULL,
+                rev INTEGER NOT NULL,
+                prompt_template TEXT NOT NULL DEFAULT '',
+                targets_json TEXT NOT NULL DEFAULT '',
+                usage_mode TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT '',
+                content_hash TEXT NOT NULL DEFAULT '',
+                ts INTEGER NOT NULL DEFAULT 0,
+                source_event TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(skill_id, rev)
+            );",
+        )?;
         // LLM 调用用量落账：每次调用的 token 消耗（细纲/正文/审核/重写/人物状态/伏笔/摘要/体检）
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS llm_call_log (

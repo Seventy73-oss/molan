@@ -101,6 +101,7 @@ pub async fn dispatch(
                         &builtin_key, &usage, &origin, &targets_s,
                     ],
                 )?;
+                molan_core::skill_rev::init_revision(db, &id, "create_skill")?;
                 Ok(Some(skill_mapped(db, &id)))
             } else {
                 let id = s("id");
@@ -155,6 +156,10 @@ pub async fn dispatch(
                     let sql = format!("UPDATE skills SET {} WHERE id=?", sets.join(","));
                     let refs: Vec<&dyn rusqlite::ToSql> = vals.iter().map(|b| b.as_ref()).collect();
                     db.exec(&sql, &refs)?;
+                    // 只有模板真的被改才自增版本（改名/改描述不应伪造新版本）
+                    if args.get("promptTemplate").is_some() {
+                        molan_core::skill_rev::bump_revision(db, &id, "update_skill")?;
+                    }
                 }
                 Ok(Some(skill_mapped(db, &id)))
             }
@@ -212,25 +217,13 @@ pub async fn dispatch(
         }
         "create_skill_from_draft" => {
             let _g = db.fs_lock.lock().unwrap_or_else(|e| e.into_inner());
-            let id = uuid::Uuid::new_v4().to_string();
-            let name = {
-                let n = s("name");
-                if n.is_empty() {
-                    "新技能".to_string()
-                } else {
-                    n
-                }
-            };
-            db.exec(
-                "INSERT INTO skills(id,name,description,prompt_template,kind,source,enabled,builtin_key,usage_mode,origin) VALUES(?1,?2,?3,?4,'user','',1,NULL,'standalone','user')",
-                &[
-                    &id as &dyn rusqlite::ToSql,
-                    &name,
-                    &s("description").chars().take(200).collect::<String>(),
-                    &s("draft"),
-                ],
-            )?;
-            Ok(Some(skill_mapped(db, &id)))
+            let (id, default_applied) = stream::skill_plan::create_from_draft(db, args)?;
+            let mut out = skill_mapped(db, &id);
+            // 缺省 targets 时回执显式标注，前端/日志不把它当作作者显式选择
+            if let Some(o) = out.as_object_mut() {
+                o.insert("defaultApplied".into(), json!(default_applied));
+            }
+            Ok(Some(out))
         }
         "draft_skill" => {
             // 技能工坊「帮我起草」：真实 LLM 生成技能模板（对齐 node draftSkill）
@@ -362,31 +355,9 @@ pub async fn dispatch(
             ))
         }
         "install_skill_bundle" => {
+            let _g = db.fs_lock.lock().unwrap_or_else(|e| e.into_inner());
             let j = load_skill_bundle(st, &s("path"))?;
-            let skills = j["skills"]
-                .as_array()
-                .cloned()
-                .unwrap_or_else(|| vec![j.clone()]);
-            let mut added = 0;
-            for sk in skills {
-                let name = sk["name"].as_str().unwrap_or("");
-                if name.is_empty() {
-                    continue;
-                }
-                let id = uuid::Uuid::new_v4().to_string();
-                let _ = db.exec(
-                    "INSERT INTO skills(id,name,description,prompt_template,kind,source,enabled,builtin_key,usage_mode,origin) VALUES(?1,?2,?3,?4,?5,'',1,NULL,'standalone','imported')",
-                    &[
-                        &id as &dyn rusqlite::ToSql,
-                        &name,
-                        &sk["description"].as_str().unwrap_or(""),
-                        &sk["promptTemplate"].as_str().or_else(|| sk["prompt_template"].as_str()).unwrap_or(""),
-                        &sk["kind"].as_str().unwrap_or("imported"),
-                    ],
-                );
-                added += 1;
-            }
-            Ok(Some(json!({"ok": true, "added": added})))
+            Ok(Some(stream::skill_plan::install_bundle(db, &j)?))
         }
         "set_skill_enabled" => {
             let on = flag("on", 1);
@@ -1385,6 +1356,10 @@ pub async fn dispatch(
                 json!({"ok": true, "bookId": book_id, "task": task, "skills": out, "count": out.len()}),
             ))
         }
+        // ---------- 阶段技能计划（只读；含 reason 与冻结的 rev/contentHash）----------
+        "plan_stage" => Ok(Some(stream::skill_plan::plan_stage_args(
+            db, &st.root, args,
+        )?)),
         "effective_book_config" => {
             let book_id = need_book("缺少 bookId")?;
             let (text, effective) = stream::book_config_block(db, &st.root, &book_id);
@@ -1897,6 +1872,7 @@ pub async fn dispatch(
                 "INSERT INTO skills(id,name,description,prompt_template,kind,source,enabled,builtin_key,usage_mode,origin) VALUES(?1,?2,?3,?4,'craft','',1,NULL,'standalone','decompose')",
                 &[&id as &dyn rusqlite::ToSql, &name, &desc, &tpl],
             )?;
+            molan_core::skill_rev::init_revision(db, &id, "save_decompose_as_skill")?;
             Ok(Some(skill_mapped(db, &id)))
         }
         "save_capability_doc" => {

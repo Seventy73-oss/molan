@@ -288,7 +288,7 @@ pub(crate) async fn import_analyze(
                     } else {
                         base_name
                     };
-                    if save_style_card(db, &name, &base, style.trim()).is_none() {
+                    if save_style_card_labeled(db, &name, &base, style.trim(), "蒸馏").is_none() {
                         stages_ok = false;
                         cx.error("导入分析：风格卡写入失败").await;
                     }
@@ -962,7 +962,7 @@ pub(crate) async fn distill_style_stream(
             }
         }
         if !name.is_empty() {
-            save_style_card(db, &name, &title, &full);
+            save_style_card_labeled(db, &name, &title, &full, "蒸馏");
         }
         if s("name").trim().is_empty() && !book_id.is_empty() {
             molan_core::books::set_book_style_text(db, &book_id, &full);
@@ -1041,16 +1041,7 @@ fn distill_sample(text: &str, limit: usize) -> String {
     chunks.join("\n\n")
 }
 
-fn save_style_card(
-    db: &molan_core::db::Db,
-    name: &str,
-    title: &str,
-    full_text: &str,
-) -> Option<String> {
-    save_style_card_labeled(db, name, title, full_text, "蒸馏")
-}
-
-fn save_style_card_labeled(
+pub(crate) fn save_style_card_labeled(
     db: &molan_core::db::Db,
     name: &str,
     title: &str,
@@ -1083,6 +1074,7 @@ fn save_style_card_labeled(
             "UPDATE skills SET description=?1, prompt_template=?2, enabled=1, origin='user', source='' WHERE id=?3",
             &[&desc as &dyn rusqlite::ToSql, &full_text, &id],
         );
+        let _ = molan_core::skill_rev::bump_revision(db, &id, "distill_style_update");
         return Some(id);
     }
     let id = uuid::Uuid::new_v4().to_string();
@@ -1090,6 +1082,7 @@ fn save_style_card_labeled(
         "INSERT INTO skills(id,name,description,prompt_template,kind,source,enabled,builtin_key) VALUES(?1,?2,?3,?4,'style','',1,NULL)",
         &[&id as &dyn rusqlite::ToSql, &name, &desc, &full_text],
     );
+    let _ = molan_core::skill_rev::init_revision(db, &id, "distill_style_new");
     Some(id)
 }
 

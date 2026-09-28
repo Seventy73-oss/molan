@@ -13,4 +13,5 @@ pub mod files;
 pub mod pipeline;
 pub mod setup_destination;
 pub mod setup_workspace;
+pub mod skill_rev;
 pub mod stats;
