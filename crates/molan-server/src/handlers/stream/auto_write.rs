@@ -342,8 +342,9 @@ fn task_full_auto(_db: &molan_core::db::Db, book_id: &str) -> bool {
     false
 }
 
-/// 宽容提取模型返回里的第一个 JSON 对象
-fn extract_json_loose(text: &str) -> Option<Value> {
+/// 宽容提取模型返回里的第一个 JSON 对象。
+/// pub(crate)：章节审核链（chapter_review）复用同一解析口径，避免两处漂移。
+pub(crate) fn extract_json_loose(text: &str) -> Option<Value> {
     if let Some(v) = extract_json_block(text) {
         return Some(v);
     }
@@ -353,22 +354,6 @@ fn extract_json_loose(text: &str) -> Option<Value> {
         return None;
     }
     serde_json::from_str::<Value>(text[start..=end].trim()).ok()
-}
-
-/// 审核单次能覆盖的正文上限（字符）。超过即视为「未覆盖全文」，不得自动放行。
-pub(crate) const REVIEW_BODY_BUDGET: usize = 9000;
-
-/// 读取设定文件，但遵守 aiOff（作者禁止自动引用则返回空，绝不外发）。
-fn read_asset_respecting_aioff(
-    db: &molan_core::db::Db,
-    book_id: &str,
-    group: &str,
-    name: &str,
-) -> String {
-    if files::file_flag(db, book_id, group, name, "aiOff") {
-        return String::new();
-    }
-    files::read_file(db, book_id, group, name).unwrap_or_default()
 }
 
 /// 生成前冻结的「同任务上一章待审稿」：文本 + hash。
@@ -410,123 +395,13 @@ fn freeze_pending_snapshot(
     Some(PendingSnapshot { text, hash })
 }
 
-/// 组装审核用 user prompt（初次审核与最终稿复审共用同一套规则，保证"审核对象=最终文本"）。
-/// 返回 (prompt, body_truncated)：body_truncated=true 表示正文超出单次预算、只覆盖了前段，
-/// 调用方必须据此转人工待审，绝不允许「只审了前 9000 字」却自动定稿。
-fn build_review_user(
-    db: &molan_core::db::Db,
-    book_id: &str,
-    ch: i64,
-    pending_block: &str,
-    body: &str,
-) -> (String, bool) {
-    // 作者资产：统一遵守 aiOff
-    let people = read_asset_respecting_aioff(db, book_id, "设定", "人物表.md");
-    let ledger = read_asset_respecting_aioff(db, book_id, "设定", "伏笔台账.md");
-    let prev = read_asset_respecting_aioff(db, book_id, "正文", &format!("第{}章.md", ch - 1));
-    let prev_tail: String = {
-        let t = prev.chars().count();
-        prev.chars().skip(t.saturating_sub(700)).collect()
-    };
-    // 时间上下文完全用 C 的 temporal helper（只含 < ch 的已定稿记忆与已批准正文），
-    // 不再直接读「前情摘要.md」——旧摘要可能覆盖到 ch 之后，属于未来信息，必须由 C 过滤。
-    let temporal = auto_book_context_for_chapter(db, book_id, ch, false);
-    // 待审连写：用调用方在生成前冻结的同任务上一章待审稿（不得在此处重新读取，
-    // 否则登记依赖时读到的可能已是被改动过的稿）。
-    let pending_note = pending_block.to_string();
-    // 当前正史事实（穿帮硬对照，A3）：活跃事实+未裁决冲突的精简清单，
-    // 审核据此抓伤势/位置/物品/伏笔状态/信息差穿帮，而不是只靠模型自觉。
-    let facts_block = molan_core::facts::list_facts(db, book_id, "", "current", 200)
-        .ok()
-        .map(|v| {
-            let mut lines: Vec<String> = Vec::new();
-            for f in v["facts"].as_array().into_iter().flatten() {
-                let st = f["subjectType"].as_str().unwrap_or("");
-                let sid = f["subjectId"].as_str().unwrap_or("");
-                let pred = f["predicate"].as_str().unwrap_or("");
-                let val = f["value"].as_str().unwrap_or("");
-                let tag = if f["state"].as_str() == Some("disputed") {
-                    "·冲突未裁决"
-                } else {
-                    ""
-                };
-                let line = if st == "secret" {
-                    let p: Value = serde_json::from_str(val).unwrap_or(Value::Null);
-                    let join = |k: &str| {
-                        p[k].as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|x| x.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("、")
-                            })
-                            .unwrap_or_default()
-                    };
-                    format!(
-                        "- [秘密{}] {}（知情：{}；不知情：{}）",
-                        tag,
-                        p["fact"].as_str().unwrap_or(val),
-                        join("known_by"),
-                        join("unknown_to")
-                    )
-                } else if st == "thread" {
-                    format!("- [伏笔{}] {} = {}", tag, sid, val)
-                } else {
-                    format!("- [事实{}] {}·{} = {}", tag, sid, pred, val)
-                };
-                lines.push(line);
-            }
-            let mut s = lines.join("\n");
-            if s.chars().count() > 1600 {
-                s = s.chars().take(1600).collect();
-                s.push_str("\n…（更多事实略，可用 list_story_facts 全查）");
-            }
-            s
-        })
-        .unwrap_or_default();
-    let facts_block = if facts_block.is_empty() {
-        "（暂无已入账事实）".to_string()
-    } else {
-        facts_block
-    };
-    let body_len = body.chars().count();
-    let truncated = body_len > REVIEW_BODY_BUDGET;
-    let prompt = format!(
-        "【本章细纲】\n{}\n\n【人物表】\n{}\n\n【伏笔台账】\n{}\n\n【当前正史事实（穿帮硬对照）】\n{}\n\n【时间线上下文（截至第{}章）】\n{}\n\n【上一章结尾】\n{}\n\n{}【待审正文】\n{}\n\n\
-审读要求：\n\
-0) 先逐条对照【当前正史事实】：伤势/位置/持有物/伏笔状态/秘密知情范围，正文与之冲突即为硬伤，直接列出；\n\
-1) 与细纲/人物表/上一章结尾比对，找硬伤：设定冲突、人物言行不一致、时间线错乱、前后矛盾、称呼错误；\n\
-2) 判断是否是可读的小说正文（不是提纲、不是提问、不是解释说明）；\n\
-3) 人称与视角是否统一；\n\
-4) 跑偏检查：是否写了本章细纲以外的剧情、是否提前揭底未回收的伏笔、是否新增了档案/人物表里没有的重要人物或设定、是否重复解决上一章已解决的冲突；\n\
-5) 时间线是否紧接着上一章结尾，有没有复述前文凑字数。\n\
-只输出 JSON：{{\"ok\":true 或 false,\"issues\":[\"问题1\",\"问题2\"],\"fix\":\"给写手的具体修改指令，不超过150字\"}}\n\
-没有硬伤时 ok=true、issues 为空数组。",
-        outline_or_empty(db, book_id, ch),
-        people.chars().take(900).collect::<String>(),
-        ledger.chars().take(900).collect::<String>(),
-        facts_block,
-        ch - 1,
-        temporal.chars().take(3000).collect::<String>(),
-        prev_tail,
-        pending_note,
-        body.chars().take(REVIEW_BODY_BUDGET).collect::<String>(),
-    );
-    (prompt, truncated)
-}
-
-fn outline_or_empty(db: &molan_core::db::Db, book_id: &str, ch: i64) -> String {
-    // 细纲同样是作者资产：标了 aiOff 就不得进入审核 prompt
-    read_asset_respecting_aioff(db, book_id, "细纲", &format!("细纲_第{}章.md", ch))
-        .chars()
-        .take(1200)
-        .collect()
-}
-
-/// 自动审核：与细纲/人物表/上一章结尾比对找硬伤；发现问题则按意见重写一轮。
-/// 返回 (可选的重写稿, 人类可读的审核结论, 是否必须转人工待审)
-/// 第三项为 true 表示审核链路本身不可信（JSON 两次解析失败 / 发现问题但重写失败保留原稿），
-/// 此时即便全自动模式也必须走「正文待审」，不得直接写正式正文。
+/// 自动审核（full_auto 章节链）：调用 chapter_review::review_body 取审核结论，
+/// 发现问题则按意见重写一轮并复核。返回 (可选的重写稿, 人类可读的审核结论, 是否必须转人工待审)。
+/// 第三项为 true 表示审核链路本身不可信（超预算 / 无渠道 / 调用失败 / JSON 两次解析失败 /
+/// 结构不完整 / 重写失败保留原稿），此时即便全自动模式也必须走「正文待审」，不得直接写正式正文。
+///
+/// 审核链实现已抽到 chapter_review（单章路径复用同一份），本函数只保留「重写+复核」编排；
+/// 行为与抽取前逐分支一致（fail-closed 语义零变化）。
 async fn review_and_fix_chapter(
     st: &Arc<AppState>,
     book_id: &str,
@@ -535,147 +410,32 @@ async fn review_and_fix_chapter(
     outline: &str,
     pending_block: &str,
 ) -> (Option<String>, String, bool) {
-    let _ = outline; // 细纲现由 build_review_user 按章号统一读取，避免调用方与审核读取不一致
+    let _ = outline; // 细纲现由审核 prompt 按章号统一读取，避免调用方与审核读取不一致
     let db = &st.db;
-    let mut sys =
-        "你是网文责编，审读一章正文。只输出一个 JSON 对象，不要解释、不要代码块标记。".to_string();
-    if let Ok(project_agent) =
-        molan_core::deepwrite::strict_agent_instructions(db, book_id, "continuity")
-    {
-        if !project_agent.is_empty() {
-            sys.push_str("\n\n");
-            sys.push_str(&project_agent);
-        }
+    // 审核调用主体（LLM + 严格 JSON + fail-closed）统一走 chapter_review，
+    // 与单章路径共用同一份实现，避免两处语义漂移。
+    let outcome = super::chapter_review::review_body(
+        db,
+        book_id,
+        ch,
+        pending_block,
+        body,
+        auto_cancel_token(),
+    )
+    .await;
+    if outcome.flagged {
+        return (None, outcome.note, true);
     }
-    let (user, body_truncated) = build_review_user(db, book_id, ch, pending_block, body);
-    if body_truncated {
-        // 超单次预算：未覆盖全文，绝不自动放行（可人工审或后续分块实现）
-        return (
-            None,
-            format!(
-                "本章正文 {} 字超过单次审核预算 {} 字，未覆盖全文 → 转人工待审",
-                body.chars().count(),
-                REVIEW_BODY_BUDGET
-            ),
-            true,
-        );
-    }
-    let Some(chn) = molan_llm::resolve_agent_channel(db, "review") else {
-        // 无审核渠道 = 审核链路不可信，必须待审，绝不 Fail-Open
-        return (None, "无可用审核渠道 → 转人工待审".to_string(), true);
-    };
-    let params = ChatParams {
-        base_url: chn["baseUrl"].as_str().unwrap_or("").to_string(),
-        api_key: chn["key"].as_str().unwrap_or("").to_string(),
-        model: chn["model"].as_str().unwrap_or("deepseek-chat").to_string(),
-        messages: vec![
-            json!({"role": "system", "content": sys}),
-            json!({"role": "user", "content": user}),
-        ],
-        temperature: 0.2,
-        max_tokens: 1500,
-        stream: false,
-        no_thinking: true,
-        reasoning_effort: String::new(),
-        log_tag: "auto_review".to_string(),
-        log_book: book_id.to_string(),
-        cancel: auto_cancel_token(),
-    };
-    let raw = match molan_llm::chat_once_retry_logged_n(params.clone(), 2).await {
-        Ok((x, usage)) => {
-            log_llm_usage(
-                db,
-                book_id,
-                "auto_review",
-                chn["model"].as_str().unwrap_or(""),
-                &usage,
-            );
-            x
-        }
-        // 审核调用失败（含 HTTP 400/网络错）：审核未完成，必须待审，绝不 Fail-Open
-        Err(e) => return (None, format!("审核调用失败（{}）→ 转人工待审", e), true),
-    };
-    // 审核必须 Fail-Closed：输出无法解析成 JSON 时带反馈重问一次，仍失败则强制转人工
-    let j = match extract_json_loose(&raw) {
-        Some(j) => j,
-        None => {
-            let mut params2 = params.clone();
-            params2.messages.push(
-                json!({"role": "assistant", "content": raw.chars().take(500).collect::<String>()}),
-            );
-            params2.messages.push(json!({"role": "user", "content": "你上一条输出无法解析为 JSON，请只输出一个 JSON 对象"}));
-            match molan_llm::chat_once_retry_logged_n(params2, 2).await {
-                Ok((raw2, usage)) => {
-                    log_llm_usage(
-                        db,
-                        book_id,
-                        "auto_review",
-                        chn["model"].as_str().unwrap_or(""),
-                        &usage,
-                    );
-                    match extract_json_loose(&raw2) {
-                        Some(j) => j,
-                        None => {
-                            return (
-                                None,
-                                "审核 JSON 两次解析失败 → 转人工待审".to_string(),
-                                true,
-                            )
-                        }
-                    }
-                }
-                Err(e) => {
-                    return (
-                        None,
-                        format!("审核 JSON 解析失败且重问失败（{}）→ 转人工待审", e),
-                        true,
-                    );
-                }
-            }
-        }
-    };
-    // Fail-Closed 严格解析：结构不完整（缺 ok / ok 非布尔 / issues 非数组）一律不可信
-    let verdict = match parse_review_verdict(&j) {
-        Some(v) => v,
-        None => {
-            return (
-                None,
-                "审核返回结构不完整（缺少布尔 ok 或 issues 数组）→ 转人工待审".to_string(),
-                true,
-            )
-        }
-    };
-    let soft_note = if verdict.soft.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "（另有{}条软建议：{}）",
-            verdict.soft.len(),
-            verdict
-                .soft
-                .iter()
-                .take(2)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("；")
-        )
-    };
-    // 明确 ok=false 却没有任何 hard 问题：判定不可信，转人工
-    if !verdict.ok && verdict.hard.is_empty() {
-        return (
-            None,
-            "审核判不通过但未给出问题 → 转人工待审".to_string(),
-            true,
-        );
-    }
-    // schema 有效 + 无 hard 问题 → 通过（软建议只提示，不阻断）
-    if verdict.ok && verdict.hard.is_empty() {
-        return (None, format!("通过{}", soft_note), false);
+    // 通过（ok=true 且无 hard 问题）：note 已含软建议摘要。
+    // 注意：ok=true 但 issues 非空属于「有硬伤」，必须继续走重写，不得当成通过。
+    if outcome.ok && outcome.issues.is_empty() {
+        return (None, outcome.note, false);
     }
     // 有 hard 问题 → 走一轮受限重写，再对最终稿严格复审
-    let issues = verdict.hard.clone();
+    let issues = outcome.issues.clone();
+    let soft_note = outcome.soft_note.clone();
     let reviewed_fp = text_fingerprint(body);
-    let fix = j["fix"].as_str().unwrap_or("").trim().to_string();
+    let fix = outcome.fix.clone();
     let list = issues
         .iter()
         .take(6)
@@ -770,7 +530,16 @@ async fn review_and_fix_chapter(
     };
     // F06：重写稿必须重新审核——内容变了旧审核结论作废，只按长度放行是假通过
     if text_fingerprint(&t) != reviewed_fp {
-        match recheck_reviewed_text(st, book_id, ch, pending_block, &t).await {
+        match super::chapter_review::recheck_reviewed_text(
+            db,
+            book_id,
+            ch,
+            pending_block,
+            &t,
+            auto_cancel_token(),
+        )
+        .await
+        {
             Ok(()) => {}
             Err(reason) => return (None, format!("重写稿复核未通过：{}", reason), true),
         }
@@ -807,13 +576,6 @@ pub(crate) fn normalize_chapter_range(from: i64, to: i64) -> i64 {
     to.min(capped)
 }
 
-/// 审核结论：hard=必须处理的问题，soft=不阻断的软建议。
-pub(crate) struct ReviewVerdict {
-    pub ok: bool,
-    pub hard: Vec<String>,
-    pub soft: Vec<String>,
-}
-
 /// 计算续跑范围：有缺章时由缺章集合的首尾驱动（主循环会自动跳过已有成果的章），
 /// 无缺章时才回落到断点 current+1。
 /// 例：缺章 [1]，current=2 → (1, 2)；这样"第1章缺、第2章已成功"能被真正补洞。
@@ -824,99 +586,6 @@ pub(crate) fn resume_range(resume_from: i64, resume_to: i64, holes: &[i64]) -> (
         return (from, to);
     }
     (resume_from, normalize_chapter_range(resume_from, resume_to))
-}
-
-/// 严格解析审核结论：仅当 ok 是布尔且 issues 是数组（元素为字符串）时才可信。
-/// 缺字段、类型不符一律 None —— Fail-Closed。warnings 可选，只作软建议不阻断。
-fn parse_review_verdict(j: &Value) -> Option<ReviewVerdict> {
-    let obj = j.as_object()?;
-    let ok = obj.get("ok")?.as_bool()?;
-    let hard: Vec<String> = obj
-        .get("issues")?
-        .as_array()?
-        .iter()
-        .map(|x| x.as_str().map(|s| s.trim().to_string()))
-        .collect::<Option<Vec<String>>>()?;
-    let soft: Vec<String> = obj
-        .get("warnings")
-        .and_then(|w| w.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str())
-                .map(|s| s.trim().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(ReviewVerdict { ok, hard, soft })
-}
-
-/// 对「已被重写改变过的最终文本」重新执行同一套审核；返回 Err(原因) 表示不得定稿。
-async fn recheck_reviewed_text(
-    st: &Arc<AppState>,
-    book_id: &str,
-    ch: i64,
-    pending_block: &str,
-    text: &str,
-) -> Result<(), String> {
-    let db = &st.db;
-    // 复核同样受单次预算约束：重写后正文若超预算，绝不能只审前段就当通过
-    let (review_user, truncated) = build_review_user(db, book_id, ch, pending_block, text);
-    if truncated {
-        return Err(format!(
-            "重写稿 {} 字超过单次审核预算 {} 字，未覆盖全文",
-            text.chars().count(),
-            REVIEW_BODY_BUDGET
-        ));
-    }
-    let Some(chn) = molan_llm::resolve_agent_channel(db, "review") else {
-        return Err("复核阶段无可用审核渠道".to_string());
-    };
-    let mut review_sys =
-        "你是网文责编，审读一章正文。只输出一个 JSON 对象，不要解释、不要代码块标记。".to_string();
-    if let Ok(extra) = molan_core::deepwrite::strict_agent_instructions(db, book_id, "continuity") {
-        if !extra.is_empty() {
-            review_sys.push_str("\n\n");
-            review_sys.push_str(&extra);
-        }
-    }
-    let params = ChatParams {
-        base_url: chn["baseUrl"].as_str().unwrap_or("").to_string(),
-        api_key: chn["key"].as_str().unwrap_or("").to_string(),
-        model: chn["model"].as_str().unwrap_or("deepseek-chat").to_string(),
-        messages: vec![
-            json!({"role": "system", "content": review_sys}),
-            json!({"role": "user", "content": review_user}),
-        ],
-        temperature: 0.2,
-        max_tokens: 1500,
-        stream: false,
-        no_thinking: true,
-        reasoning_effort: String::new(),
-        log_tag: "auto_review_final".to_string(),
-        log_book: book_id.to_string(),
-        cancel: auto_cancel_token(),
-    };
-    let raw = molan_llm::chat_once_retry_logged_n(params, 2)
-        .await
-        .map(|(x, usage)| {
-            log_llm_usage(
-                db,
-                book_id,
-                "auto_review_final",
-                chn["model"].as_str().unwrap_or(""),
-                &usage,
-            );
-            x
-        })
-        .map_err(|e| format!("复核调用失败（{}）", e))?;
-    let j = extract_json_loose(&raw).ok_or_else(|| "复核返回无法解析为 JSON".to_string())?;
-    let v = parse_review_verdict(&j).ok_or_else(|| "复核返回结构不完整".to_string())?;
-    if v.ok && v.hard.is_empty() {
-        auto_log(ch, "review", format!("第{}章 重写稿复核通过", ch));
-        Ok(())
-    } else {
-        Err(format!("ok={} hard={}", v.ok, v.hard.len()))
-    }
 }
 
 // 包装层：失败时把错误落盘（进度保留最后持久值），面板/续跑可见
@@ -1441,7 +1110,16 @@ async fn write_one_chapter(
     // F06：去AI味改变了正文 → 旧审核结论作废，必须对最终文本重审
     if full_auto && !needs_review && text_fingerprint(&body) != reviewed_fp {
         auto_log(ch, "review", format!("第{}章 去味后最终稿复审…", ch));
-        match recheck_reviewed_text(st, book_id, ch, &pending_block, &body).await {
+        match super::chapter_review::recheck_reviewed_text(
+            db,
+            book_id,
+            ch,
+            &pending_block,
+            &body,
+            auto_cancel_token(),
+        )
+        .await
+        {
             Ok(()) => {
                 save_auto_message(
                     db,
@@ -3114,6 +2792,16 @@ pub(crate) async fn auto_write_stop(
 
 /// 解析「自动去味」方法：显式 override > 本书设置 book_humanize__<bookId> > official:standard。
 /// 返回 (方法标识, 方法提示词)；方法为 "none" 时提示词为空 = 关闭自动去味。
+///
+/// **humanizeOverride 三态契约（全仓唯一实现，chat.rs deai 分支与批量链共用）**：
+/// - `""`（空串/None/纯空白）= 未指定 → 回落书级 `book_humanize__<bookId>`；
+///   书级也缺失（或值为 "null"）→ 再缺省 `official:standard`。
+/// - `"none"` = **明确关闭**：返回 ("none", "")，不注入任何方法提示词。
+///   注意这不会回落到书级设置——显式关闭必须压过书级默认。
+/// - `"official:*"` / `"skill:<id>"` = 显式指定，按对应内置键或技能模板取提示词。
+///
+/// 历史教训：chat.rs 内联版曾把 "none" 当作「未指定」回落书级，与批量链语义相反，
+/// 导致同一 override 在两条路径上行为分叉；本函数是统一后的唯一真源。
 pub(crate) fn resolve_humanize(
     db: &molan_core::db::Db,
     book_id: &str,
@@ -3396,29 +3084,6 @@ mod tests {
 
     fn v(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
-    }
-
-    #[test]
-    fn review_verdict_is_fail_closed() {
-        let pass = parse_review_verdict(&v(r#"{"ok":true,"issues":[]}"#)).unwrap();
-        assert!(pass.ok && pass.hard.is_empty());
-        // ok=false 且无 hard 问题：ok=false 必须保留（调用方据此转人工）
-        let neg = parse_review_verdict(&v(r#"{"ok":false,"issues":[]}"#)).unwrap();
-        assert!(!neg.ok && neg.hard.is_empty());
-        // 缺 ok / 缺 issues / 类型不符 一律不可信
-        assert!(parse_review_verdict(&v(r#"{"issues":[]}"#)).is_none());
-        assert!(parse_review_verdict(&v(r#"{"ok":true}"#)).is_none());
-        assert!(parse_review_verdict(&v(r#"{"ok":"true","issues":[]}"#)).is_none());
-        assert!(parse_review_verdict(&v(r#"{"ok":true,"issues":""}"#)).is_none());
-        assert!(parse_review_verdict(&v(r#"{"ok":true,"issues":[1]}"#)).is_none());
-        assert!(parse_review_verdict(&v("{}")).is_none());
-        // hard 问题保留，且软建议单独成列、不混入 hard
-        let hard = parse_review_verdict(&v(
-            r#"{"ok":false,"issues":["人物死亡冲突"],"warnings":["节奏略慢"]}"#,
-        ))
-        .unwrap();
-        assert_eq!(hard.hard, vec!["人物死亡冲突".to_string()]);
-        assert_eq!(hard.soft, vec!["节奏略慢".to_string()]);
     }
 
     #[test]

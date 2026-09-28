@@ -978,6 +978,30 @@ pub(crate) async fn chat_stream(
         cx.ev(json!({"type": "save_skipped", "reasons": save_errors}))
             .await;
     }
+    // 单章审核后关（T4b）：显式写作任务的正文待审**落盘成功后**，对已落盘内容做一次剧情审核。
+    // 顺序：写前=文风卡约束 → 正文 → 去味（上方 auto_humanize 门，既有）→ 待审落盘 → 审核（此处）。
+    // 审核对象 = 实际写入待审的文件正文，bodyHash 与之一一对应（再改正文即作废）。
+    // 审核失败/无渠道一律 ok:false + reason（fail-closed）：不阻断已完成的保存，也不冒充通过。
+    let mut review_summary: Option<Value> = None;
+    if !interrupted
+        && is_body_cmd
+        && a("writeIntent").as_str() == Some("explicit-task")
+        && !book_id.is_empty()
+        && full.chars().count() >= 300
+    {
+        if let Some((ev, summary)) = super::chapter_review::review_pending_saved(
+            db,
+            &book_id,
+            want_ch,
+            &saved_files,
+            cancel_tok.clone(),
+        )
+        .await
+        {
+            cx.ev(ev).await;
+            review_summary = Some(summary);
+        }
+    }
     let mut parseable = molan_llm::extract_json(&full);
     // 中断文本不是成果：不解析 bookSetup、不建书、不落盘（只留聊天记录）。
     if !interrupted {
@@ -1037,6 +1061,12 @@ pub(crate) async fn chat_stream(
             });
             parseable = Some(result.clone());
             cx.result(&result).await;
+        }
+    }
+    // 审核摘要并入本轮 result_json（前端消息卡可回看审核结论；不覆盖模型原有字段）
+    if let Some(rv) = review_summary {
+        if let Some(m) = parseable.get_or_insert_with(|| json!({})).as_object_mut() {
+            m.insert("review".to_string(), rv);
         }
     }
     // 保存助手消息
@@ -1180,45 +1210,12 @@ pub(crate) async fn inline_chat(
     match mode.as_str() {
         // ── 去AI味（选区与整章共用）。输出必须是纯正文：前端「替换」把结果原样写回文档 ──
         "deai" => {
-            let ov = a("humanizeOverride").as_str().unwrap_or("").to_string();
-            let method = if !ov.is_empty() && ov != "none" {
-                ov
-            } else {
-                let bk = molan_llm::get_setting(db, &format!("book_humanize__{}", book_id));
-                if bk.is_empty() || bk == "none" {
-                    "official:standard".to_string()
-                } else {
-                    bk
-                }
-            };
-            let method_prompt = if let Some(sid) = method.strip_prefix("skill:") {
-                db.q_json(
-                    "SELECT prompt_template FROM skills WHERE id=?1 OR builtin_key=?1",
-                    &[&sid as &dyn rusqlite::ToSql],
-                )
-                .ok()
-                .and_then(|v| {
-                    v.first()
-                        .and_then(|r| r["promptTemplate"].as_str().map(|x| x.to_string()))
-                })
-                .unwrap_or_default()
-            } else {
-                let key = if method == "official:deep" {
-                    "method.humanize.deep"
-                } else {
-                    "method.humanize.standard"
-                };
-                db.q_json(
-                    "SELECT prompt_template FROM skills WHERE builtin_key=?1",
-                    &[&key as &dyn rusqlite::ToSql],
-                )
-                .ok()
-                .and_then(|v| {
-                    v.first()
-                        .and_then(|r| r["promptTemplate"].as_str().map(|x| x.to_string()))
-                })
-                .unwrap_or_default()
-            };
+            // humanizeOverride 三态（与批量路径 resolve_humanize 同一实现，语义不再分叉）：
+            //   ""       = 回落书级 book_humanize__<book>，再缺省 official:standard
+            //   "none"   = 明确关闭（不注入任何方法提示词）
+            //   "official:*" / "skill:<id>" = 显式指定
+            let (_method, method_prompt) =
+                super::auto_write::resolve_humanize(db, &book_id, a("humanizeOverride").as_str());
             let report = molan_core::deai::score_text(&input);
             sys.push_str(
                     "你是网文成章质检引擎（去AI味整合门）。对给定正文做去AI味改写。\n\
