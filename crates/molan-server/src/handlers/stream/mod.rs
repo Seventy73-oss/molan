@@ -1653,8 +1653,10 @@ pub(crate) use auto_write::post_approved_chapter;
 pub(crate) mod agent_loop;
 mod agent_tools;
 pub(crate) mod chat;
+pub(crate) mod chapter_review;
 mod decompose;
 pub(crate) mod fallback;
+pub(crate) mod skill_plan;
 mod sources;
 pub(crate) mod stage_context;
 
