@@ -63,7 +63,9 @@ pub struct BeginRun {
 }
 
 /// 幂等启动/取回 run：同 (session_id, request_id) 重复调用返回既有行，不重复建。
-/// 返回 camelCase 行（Db::q_json 口径）。
+/// 返回 camelCase 行（Db::q_json 口径），并附加**内部字段** `created`：
+/// true = 本次调用真的插入了新行；false = 取回既有行（可能是别的循环正在跑的 running 行）。
+/// `created` 不入库，只用于调用方区分「我刚创建」与「我取回了既有 running 行」（F6 并发重入）。
 pub fn begin_run(db: &Db, r: &BeginRun) -> Result<Value> {
     ensure_schema(db)?;
     if r.session_id.trim().is_empty() || r.request_id.trim().is_empty() {
@@ -71,7 +73,7 @@ pub fn begin_run(db: &Db, r: &BeginRun) -> Result<Value> {
     }
     let now = now_ms();
     let id = uuid::Uuid::new_v4().to_string();
-    db.exec(
+    let inserted = db.exec(
         "INSERT OR IGNORE INTO agent_run(id,book_id,session_id,request_id,task,target_ch,model,status,tool_round,max_tool_rounds,budget_tokens,used_prompt_tokens,used_completion_tokens,created_at,updated_at,error)
          VALUES(?1,?2,?3,?4,?5,?6,?7,'running',0,?8,?9,0,0,?10,?10,'')",
         &[
@@ -86,14 +88,17 @@ pub fn begin_run(db: &Db, r: &BeginRun) -> Result<Value> {
             &r.budget_tokens,
             &now,
         ],
-    )?;
-    let rows = db.q_json(
-        "SELECT * FROM agent_run WHERE session_id=?1 AND request_id=?2",
-        &[&r.session_id, &r.request_id],
-    )?;
-    rows.into_iter()
+    )? > 0;
+    let mut row = db
+        .q_json(
+            "SELECT * FROM agent_run WHERE session_id=?1 AND request_id=?2",
+            &[&r.session_id, &r.request_id],
+        )?
+        .into_iter()
         .next()
-        .ok_or_else(|| anyhow!("agent_run 写入失败"))
+        .ok_or_else(|| anyhow!("agent_run 写入失败"))?;
+    row["created"] = Value::Bool(inserted);
+    Ok(row)
 }
 
 pub fn get_run(db: &Db, run_id: &str) -> Result<Option<Value>> {
@@ -285,6 +290,36 @@ mod tests {
         assert_eq!(n, 1);
         let c = begin(&db, "r2", 0);
         assert_ne!(a["id"], c["id"], "不同 requestId 是新 run");
+    }
+
+    #[test]
+    fn begin_run_reports_created_flag_for_reentry_detection() {
+        // F6：调用方必须能区分「本次新建」与「取回既有 running 行」。
+        let (_d, db) = fixture();
+        let first = begin(&db, "r1", 0);
+        assert_eq!(first["created"], true, "首次调用必须标记 created=true");
+        assert_eq!(first["status"], "running");
+        let again = begin(&db, "r1", 0);
+        assert_eq!(again["created"], false, "重入必须标记 created=false");
+        assert_eq!(again["id"], first["id"]);
+        assert_eq!(again["status"], "running", "既有行仍是 running");
+        // created 是内部字段，绝不入库
+        let row = db
+            .q_json("SELECT * FROM agent_run WHERE request_id='r1'", &[])
+            .unwrap()
+            .remove(0);
+        assert!(row.get("created").is_none(), "created 不得落库：{}", row);
+        // 终态后再 begin：created=false + 终态可见（重放路径）
+        let id = first["id"].as_str().unwrap();
+        finish_run(&db, id, "done", "").unwrap();
+        let after = begin(&db, "r1", 0);
+        assert_eq!(after["created"], false);
+        assert_eq!(after["status"], "done");
+        assert_eq!(
+            begin(&db, "r2", 0)["created"],
+            true,
+            "新 requestId 仍是新建"
+        );
     }
 
     #[test]

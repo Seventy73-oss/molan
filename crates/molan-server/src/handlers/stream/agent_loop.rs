@@ -35,7 +35,12 @@ fn session_abort_key(session_id: &str) -> String {
     format!("session:{}", session_id)
 }
 
-/// abort_chat 兜底：requestId 为空且带 sessionId 时，取消该会话在飞的 agent run。
+/// abort_chat 兜底：requestId 为空且带 sessionId 时，取消该会话**在飞**的 agent run。
+///
+/// F1：只有 SESSION_TOKENS 里确实有该会话的在飞令牌时才登记取消标记。无在飞 run 时
+/// 直接返回——否则 `chat::request_abort(session:<sid>)` 会把标记永久留在全局 ABORTS 里
+/// （只有 run 循环内的 take_abort 会消费它），毒化该会话的下一条 agent_turn：
+/// 循环第一行命中该标记，零模型调用、零输出直接判 interrupted，表现为"发了消息 AI 什么都不回"。
 pub(crate) fn abort_by_args(args: &Value) {
     let has_req = args
         .get("requestId")
@@ -50,12 +55,16 @@ pub(crate) fn abort_by_args(args: &Value) {
     if has_req || sid.is_empty() {
         return;
     }
+    // 先取在飞令牌：没有在飞 run 就没有消费者，登记标记等于泄漏。
+    let inflight = SESSION_TOKENS
+        .lock()
+        .ok()
+        .and_then(|g| g.get(&sid).cloned());
+    let Some(token) = inflight else {
+        return;
+    };
     chat::request_abort(&session_abort_key(&sid));
-    if let Ok(g) = SESSION_TOKENS.lock() {
-        if let Some(t) = g.get(&sid) {
-            t.cancel();
-        }
-    }
+    token.cancel();
 }
 
 /// RAII：run 收尾（含 panic/提前返回）必须注销双键，防止令牌表泄漏与串号取消。
@@ -209,10 +218,21 @@ pub(crate) async fn run_agent_turn(
         },
     )?;
     let run_id = run["id"].as_str().unwrap_or("").to_string();
-    if run["status"].as_str().unwrap_or("running") != "running" {
+    let created = run["created"].as_bool().unwrap_or(false);
+    let run_status = run["status"].as_str().unwrap_or("running").to_string();
+    if run_status != "running" {
         let receipt =
             json!({"ok": true, "runId": run_id, "status": run["status"], "replayed": true});
         cx.done(receipt.clone()).await;
+        return Ok(Some(receipt));
+    }
+    // F6：既有 running 行 + 非本次新建 = 同一 requestId 的重入（前端重试/双开/网络重发）。
+    // 绝不进入循环、绝不插第二条 user 消息：同一 run 只能有一个循环，否则 agent_turn 轮次
+    // 交错、record_turn 非原子取号撞主键、同 run 落两条 assistant 消息。
+    if !created {
+        let receipt = json!({"ok": false, "status": "already_running", "runId": run_id});
+        cx.ev(json!({"type":"done","status":"already_running","runId":run_id}))
+            .await;
         return Ok(Some(receipt));
     }
 
@@ -781,6 +801,211 @@ mod tests {
         // 带 requestId 时不走 session 兜底
         abort_by_args(&json!({"requestId": "r", "sessionId": "s-x"}));
         assert!(!chat::take_abort("session:s-x"));
+    }
+
+    /// F1 单元锁：无在飞 run 时 abort_by_args 不得把 session 标记推进全局 ABORTS。
+    #[test]
+    fn f1_idle_session_abort_leaves_no_marker() {
+        // 空闲会话（SESSION_TOKENS 无该 sid）：什么都不登记
+        abort_by_args(&json!({"sessionId": "s-idle"}));
+        assert!(
+            !chat::take_abort("session:s-idle"),
+            "无在飞 run 时不得登记取消标记（否则毒化下一条 agent_turn）"
+        );
+        // 再调一次仍无残留（不是"吞一次"而是"根本没登记"）
+        abort_by_args(&json!({"sessionId": "s-idle"}));
+        assert!(!chat::take_abort("session:s-idle"));
+        // 空 sessionId / 带 requestId 同样不登记
+        abort_by_args(&json!({"sessionId": "  "}));
+        abort_by_args(&json!({"requestId": "r1", "sessionId": "s-idle2"}));
+        assert!(!chat::take_abort("session:s-idle2"));
+    }
+
+    /// F1 端到端：空闲会话被 abort 后，下一条 agent_turn 必须正常 done（零输出事故回归锁）。
+    #[tokio::test]
+    async fn f1_abort_on_idle_session_does_not_poison_next_turn() {
+        let (_d, db, book, sid) = fixture();
+        // 此刻没有任何在飞 run（等同前端点了停止、但 agent 并未在跑）
+        abort_by_args(&json!({"sessionId": sid}));
+        let (res, events) = collect(
+            &db,
+            &args(&book, &sid, "你好，介绍一下这本书的状态", "req-f1"),
+        )
+        .await;
+        let out = res.unwrap().unwrap();
+        assert_eq!(
+            out["status"], "done",
+            "空闲会话 abort 后下一条必须正常完成：{:?}",
+            out
+        );
+        // 必须真的调了模型：有 delta 输出，run 也不是 interrupted
+        assert!(
+            events.iter().any(|e| e["type"] == "delta"),
+            "必须零标记泄漏、正常产生输出：{:?}",
+            events
+        );
+        let row = run_row(&db, "req-f1");
+        assert_eq!(row["status"], "done");
+        // 再下一条也正常（确认不是"只吞一次"而是没登记）
+        let (res2, _) = collect(&db, &args(&book, &sid, "再来一条", "req-f1b")).await;
+        assert_eq!(res2.unwrap().unwrap()["status"], "done");
+    }
+
+    /// F1 反向锁：确有在飞 run 时，session 兜底仍必须生效（修复不能削弱真实取消能力）。
+    #[tokio::test]
+    async fn f1_abort_with_inflight_run_still_cancels() {
+        let (_d, _db, _book, sid) = fixture();
+        // 模拟在飞 run：登记该会话的取消令牌（run_agent_turn 循环内做的同一件事）
+        let token = CancellationToken::new();
+        if let Ok(mut g) = SESSION_TOKENS.lock() {
+            g.insert(sid.clone(), token.clone());
+        }
+        abort_by_args(&json!({"sessionId": sid}));
+        assert!(token.is_cancelled(), "在飞 run 必须被取消");
+        assert!(
+            chat::take_abort(&session_abort_key(&sid)),
+            "在飞 run 时仍要登记标记供循环边界消费"
+        );
+        if let Ok(mut g) = SESSION_TOKENS.lock() {
+            g.remove(&sid);
+        }
+        // 令牌注销后（run 已收尾）再 abort：不再登记，避免泄漏
+        abort_by_args(&json!({"sessionId": sid}));
+        assert!(!chat::take_abort(&session_abort_key(&sid)));
+    }
+
+    // ---------- F6：同 requestId running 期重入不得进入循环 ----------
+
+    /// 顺序双发：第二次得到 already_running，不重跑模型、不插第二条 user 消息。
+    #[tokio::test]
+    async fn f6_sequential_reentry_same_request_is_rejected_as_running() {
+        let (_d, db, book, sid) = fixture();
+        // 预置一条既有 running 行（模拟前一次请求已启动、尚未到终态）
+        let run = agent_run::begin_run(
+            &db,
+            &BeginRun {
+                book_id: book.clone(),
+                session_id: sid.clone(),
+                request_id: "req-f6".into(),
+                task: "agent".into(),
+                model: "mock-model".into(),
+                target_ch: None,
+                max_tool_rounds: MAX_TOOL_ROUNDS_DEFAULT,
+                budget_tokens: BUDGET_TOKENS_DEFAULT,
+            },
+        )
+        .unwrap();
+        let run_id = run["id"].as_str().unwrap().to_string();
+        // 模拟"前一次请求已进入循环并写完自己的 user 消息"（run_agent_turn 落库的同一行）
+        db.exec(
+            "INSERT INTO messages(id,session_id,role,content,context_json,steps_json,result_json,created_at,interrupted) VALUES(?1,?2,'user','前一次在飞的请求',NULL,NULL,NULL,0,0)",
+            &[
+                &uuid::Uuid::new_v4().to_string() as &dyn rusqlite::ToSql,
+                &sid,
+            ],
+        )
+        .unwrap();
+        let (res, events) =
+            collect(&db, &args(&book, &sid, "[call:scan_book_tree]", "req-f6")).await;
+        let out = res.unwrap().unwrap();
+        assert_eq!(out["ok"], false, "重入不得报成功：{:?}", out);
+        assert_eq!(out["status"], "already_running");
+        assert_eq!(out["runId"], run_id.as_str());
+        // 结构化冲突事件：done{status:already_running, runId}
+        let done = events
+            .iter()
+            .find(|e| e["type"] == "done")
+            .expect("必须发 done 事件");
+        assert_eq!(done["status"], "already_running");
+        assert_eq!(done["runId"], run_id.as_str());
+        // 绝不进入循环：无 meta/tool/delta，模型一次都没调
+        assert!(
+            !events.iter().any(|e| e["type"] == "meta"),
+            "不得进入循环（无 meta）：{:?}",
+            events
+        );
+        assert!(!events.iter().any(|e| e["type"] == "tool"));
+        assert!(!events.iter().any(|e| e["type"] == "delta"));
+        // messages 表仍只有前一次那一条 user：本次重入不插 user、不插 assistant
+        let msgs = db
+            .q_json(
+                "SELECT role, content FROM messages WHERE session_id=?1",
+                &[&sid as &dyn rusqlite::ToSql],
+            )
+            .unwrap();
+        assert_eq!(msgs.len(), 1, "不得插第二条消息：{:?}", msgs);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "前一次在飞的请求");
+        // run 账本不被污染：轮次仍 0、状态仍 running、只有一条 run
+        let row = run_row(&db, "req-f6");
+        assert_eq!(row["status"], "running");
+        assert_eq!(row["toolRound"].as_i64().unwrap(), 0);
+        let n = db
+            .q_json(
+                "SELECT COUNT(*) AS c FROM agent_run WHERE request_id='req-f6'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(n[0]["c"].as_i64().unwrap(), 1);
+        // 真双发（join!）：同 requestId 并发重入也必须只跑一次。
+        // 结果允许 done（抢到执行权）/ already_running（被拒）/ replayed（抢到时已到终态），
+        // 但不变式是硬的：该 requestId 只落一条 user、只落一条 assistant、只跑一轮循环。
+        let a1 = args(&book, &sid, "并发一", "req-f6c");
+        let a2 = args(&book, &sid, "并发二", "req-f6c");
+        let (a, b) = tokio::join!(collect(&db, &a1), collect(&db, &a2));
+        let ra = a.0.unwrap().unwrap();
+        let rb = b.0.unwrap().unwrap();
+        let statuses = [
+            ra["status"].as_str().unwrap_or("").to_string(),
+            rb["status"].as_str().unwrap_or("").to_string(),
+        ];
+        assert!(
+            statuses
+                .iter()
+                .all(|s| s == "done" || s == "already_running"),
+            "并发结果必须收敛为 done/already_running：{:?}",
+            statuses
+        );
+        // 恰好一次真跑：runId 一致，且该 run 的轮次只被一个循环写过
+        assert_eq!(ra["runId"], rb["runId"], "同 requestId 必须同一个 run");
+        let cid = ra["runId"].as_str().unwrap().to_string();
+        let cid_turns = agent_run::list_turns(&db, &cid).unwrap();
+        let assistant_turns = cid_turns
+            .iter()
+            .filter(|t| t["role"].as_str() == Some("assistant"))
+            .count();
+        assert_eq!(
+            assistant_turns, 1,
+            "并发重入不得让同一 run 被跑两遍（assistant 轮次应恰好 1）：{:?}",
+            cid_turns
+        );
+        let users_c = db
+            .q_json(
+                "SELECT COUNT(*) AS c FROM messages WHERE session_id=?1 AND role='user'",
+                &[&sid as &dyn rusqlite::ToSql],
+            )
+            .unwrap();
+        assert_eq!(
+            users_c[0]["c"].as_i64().unwrap(),
+            2,
+            "同 requestId 并发只能多出 1 条 user（前一次 1 条 + 本次 1 条）"
+        );
+        let turns = agent_run::list_turns(&db, run_id.as_str()).unwrap();
+        assert!(turns.is_empty(), "既有 running 行不得被重入者追加轮次");
+    }
+
+    /// 终态重放与 running 重入必须区分：终态走 replayed 回执，running 走 already_running。
+    #[tokio::test]
+    async fn f6_replayed_terminal_run_still_returns_receipt() {
+        let (_d, db, book, sid) = fixture();
+        let a = args(&book, &sid, "[call:scan_book_tree]", "req-f6d");
+        let (r1, _) = collect(&db, &a).await;
+        assert_eq!(r1.unwrap().unwrap()["status"], "done");
+        let (r2, events2) = collect(&db, &a).await;
+        let out2 = r2.unwrap().unwrap();
+        assert_eq!(out2["replayed"], true, "终态仍走重放回执");
+        assert_ne!(out2["status"], "already_running");
+        assert!(events2.iter().any(|e| e["type"] == "done"));
     }
 
     #[test]
