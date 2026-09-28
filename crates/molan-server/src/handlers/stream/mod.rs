@@ -1623,10 +1623,8 @@ pub async fn dispatch_stream(
         "distill_style_stream" | "redistill_book_style" => {
             return decompose::distill_style_stream(st, cmd, args, tx).await; // 风格蒸馏（流式）
         }
-        // ============ 风格样例（一次性） ============
-        "gen_style_sample" => return decompose::gen_style_sample(st, cmd, args, tx).await,
-        // ============ 导入通读分析（事件流 4 步） ============
-        "import_analyze" => return decompose::import_analyze(st, cmd, args, tx).await,
+        "gen_style_sample" => return decompose::gen_style_sample(st, cmd, args, tx).await, // 风格样例（一次性）
+        "import_analyze" => return decompose::import_analyze(st, cmd, args, tx).await, // 导入通读分析（事件流4步）
         // ============ 会话标题生成 ============
         "gen_session_title" => return decompose::gen_session_title(st, cmd, args, tx).await,
         // ============ 小说拆解（流式：单段直出 / 分段 map 后 reduce 汇总） ============
