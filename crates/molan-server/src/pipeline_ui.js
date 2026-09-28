@@ -105,8 +105,8 @@
       'border-radius:8px 0 0 8px;background:' + T.bg + ';color:' + T.text3 + ';font-family:' + T.font + ';',
       'font-size:11px;line-height:1.6;padding:10px 4px;cursor:pointer;writing-mode:vertical-rl;letter-spacing:.08em}',
       '#__wx_pipeline_entry:hover{color:' + T.accent + ';border-color:' + T.accent + '}',
-      // 顶部居中小条 toast（白底细边框，3 秒消失；取代旧的大黑条）
-      '#__wx_toast{position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:10004;max-width:min(560px,86vw);',
+      // 顶部居中小条 toast（白底细边框，3 秒消失；独立 id __wxpipe_toast，绝不可复用 glue 的 __wx_toast——样式叠加会把旧 toast 拉伸成全屏大黑框）
+      '#__wxpipe_toast{position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:10004;max-width:min(560px,86vw);',
       'background:' + T.bg + ';border:1px solid ' + T.line + ';border-radius:8px;padding:9px 14px;',
       'font-family:' + T.font + ';font-size:12px;line-height:1.6;color:' + T.text + '}',
       '#__wx_limit_bar{position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:10003;max-width:min(680px,92vw);',
@@ -126,10 +126,10 @@
   let toastTimer = null;
   function toast(msg) {
     ensureStyle();
-    let t = doc.getElementById('__wx_toast');
+    let t = doc.getElementById('__wxpipe_toast');
     if (!t) {
       t = el('div');
-      t.id = '__wx_toast';
+      t.id = '__wxpipe_toast';
       (doc.body || doc.documentElement).appendChild(t);
     }
     t.textContent = msg;
