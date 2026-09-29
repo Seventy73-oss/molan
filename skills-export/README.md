@@ -1,0 +1,61 @@
+# Molan 技能库导出（NAS 服务删除前提取）
+
+- 来源：nas:/vol2/1000/molan-books/writerx.db（只读导出）
+- 导出时间：2026-09-29T23:10:00+08:00
+- skills 52 条 / skill_revision 52 条 / dw_agent_profile 12 条 / dw_book_skill 0 条
+- skills-export.json = 全表原始行；md/ = 逐技能可读版（frontmatter+描述+提示词模板）
+- 书稿与整库最终备份：molan-books-final.tar.gz（本仓根目录 nas-final-backup 不入库；此 tar 仅存本地+NAS删除前已下载）
+
+## 索引
+- [builtin] 剧情推演 -> md/builtin__剧情推演.md
+- [builtin] 小说细纲生成 -> md/builtin__小说细纲生成.md
+- [builtin] 展开正文写作 -> md/builtin__展开正文写作.md
+- [builtin] 官方标准去味 -> md/builtin__官方标准去味.md
+- [builtin] 官方深度去味 -> md/builtin__官方深度去味.md
+- [builtin] 短篇正文 -> md/builtin__短篇正文.md
+- [builtin] 短篇导语生成 -> md/builtin__短篇导语生成.md
+- [builtin] 短篇全书蓝图 -> md/builtin__短篇全书蓝图.md
+- [builtin] 短篇节正文生成 -> md/builtin__短篇节正文生成.md
+- [builtin] 短篇爆款体检 -> md/builtin__短篇爆款体检.md
+- [builtin] 卡文急救 -> md/builtin__卡文急救.md
+- [builtin] 简介打磨 -> md/builtin__简介打磨.md
+- [builtin] 回坑简报 -> md/builtin__回坑简报.md
+- [builtin] 场景描写增强 -> md/builtin__场景描写增强.md
+- [builtin] 对白润色 -> md/builtin__对白润色.md
+- [builtin] 设定一致性检查 -> md/builtin__设定一致性检查.md
+- [builtin] 爽点节奏分析 -> md/builtin__爽点节奏分析.md
+- [builtin] 开局诊断 -> md/builtin__开局诊断.md
+- [builtin] 试读反馈 -> md/builtin__试读反馈.md
+- [builtin] 设定提取 -> md/builtin__设定提取.md
+- [builtin] 资料库体检 -> md/builtin__资料库体检.md
+- [builtin] 设定共建 -> md/builtin__设定共建.md
+- [builtin] 新书共创 -> md/builtin__新书共创.md
+- [builtin] 设定整理 -> md/builtin__设定整理.md
+- [builtin] 技能工坊 -> md/builtin__技能工坊.md
+- [style] 斗破 -> md/style__斗破.md
+- [style] 全球高武_第1-10章拆解 -> md/style__全球高武_第1-10章拆解.md
+- [user] 新技能 -> md/user__新技能.md
+- [craft] 拆解手法 -> md/craft__拆解手法.md
+- [style] 诡秘之主 -> md/style__诡秘之主.md
+- [style] 诡秘之主_第1章拆解 -> md/style__诡秘之主_第1章拆解.md
+- [method] 去AI味流水线V0.4.2 -> md/method__去AI味流水线V0.4.2.md
+- [craft] 题材库·仙侠 -> md/craft__题材库·仙侠.md
+- [craft] 题材库·历史 -> md/craft__题材库·历史.md
+- [craft] 题材库·悬疑灵异 -> md/craft__题材库·悬疑灵异.md
+- [craft] 题材库·武侠 -> md/craft__题材库·武侠.md
+- [craft] 题材库·游戏 -> md/craft__题材库·游戏.md
+- [craft] 题材库·玄幻 -> md/craft__题材库·玄幻.md
+- [craft] 题材库·科幻 -> md/craft__题材库·科幻.md
+- [craft] 题材库·言情 -> md/craft__题材库·言情.md
+- [craft] 题材库·都市 -> md/craft__题材库·都市.md
+- [craft] 题材库·跨题材总览 -> md/craft__题材库·跨题材总览.md
+- [style] 文风库·玄幻 -> md/style__文风库·玄幻.md
+- [style] 文风库·仙侠 -> md/style__文风库·仙侠.md
+- [style] 文风库·都市 -> md/style__文风库·都市.md
+- [style] 文风库·言情 -> md/style__文风库·言情.md
+- [style] 文风库·武侠 -> md/style__文风库·武侠.md
+- [style] 文风库·历史 -> md/style__文风库·历史.md
+- [style] 文风库·军事 -> md/style__文风库·军事.md
+- [style] 文风库·悬疑灵异 -> md/style__文风库·悬疑灵异.md
+- [style] 文风库·游戏 -> md/style__文风库·游戏.md
+- [style] 文风库·科幻 -> md/style__文风库·科幻.md

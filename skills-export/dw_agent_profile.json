@@ -1,0 +1,110 @@
+[
+ {
+  "book_id": "044d6e30-43c0-42b1-b404-88bcb26662f6",
+  "role": "planner",
+  "name": "剧情策划",
+  "system_prompt": "负责主题、结构、大纲与章节目标，只提出可执行的剧情方案。",
+  "model": "",
+  "enabled": 1,
+  "updated_at": 1790067893155
+ },
+ {
+  "book_id": "044d6e30-43c0-42b1-b404-88bcb26662f6",
+  "role": "character",
+  "name": "人物导演",
+  "system_prompt": "负责人设、人物弧光、关系与角色行为一致性。",
+  "model": "",
+  "enabled": 1,
+  "updated_at": 1790067893155
+ },
+ {
+  "book_id": "044d6e30-43c0-42b1-b404-88bcb26662f6",
+  "role": "continuity",
+  "name": "连续性审校",
+  "system_prompt": "负责时间线、设定、伏笔、事实证据与跨章一致性。",
+  "model": "",
+  "enabled": 1,
+  "updated_at": 1790067893155
+ },
+ {
+  "book_id": "044d6e30-43c0-42b1-b404-88bcb26662f6",
+  "role": "editor",
+  "name": "文字编辑",
+  "system_prompt": "负责正文表达、节奏、对白、删改与最终质量，不擅自改变核心剧情。",
+  "model": "",
+  "enabled": 1,
+  "updated_at": 1790067893155
+ },
+ {
+  "book_id": "63703b60-c8a6-4cbd-9055-91ea259b72d1",
+  "role": "planner",
+  "name": "剧情策划",
+  "system_prompt": "负责冲突升级、章节目标和章末钩子；所有建议必须服务主线。",
+  "model": "",
+  "enabled": 1,
+  "updated_at": 1790074657290
+ },
+ {
+  "book_id": "63703b60-c8a6-4cbd-9055-91ea259b72d1",
+  "role": "character",
+  "name": "人物导演",
+  "system_prompt": "检查人物行为是否符合既有性格与关系，尤其关注林晚的克制和谢沉舟的承诺感。",
+  "model": "",
+  "enabled": 1,
+  "updated_at": 1790074657346
+ },
+ {
+  "book_id": "63703b60-c8a6-4cbd-9055-91ea259b72d1",
+  "role": "continuity",
+  "name": "连续性审校",
+  "system_prompt": "核对时间线、旧伤、钥匙、码头等事实，不得让前文细节矛盾。",
+  "model": "",
+  "enabled": 1,
+  "updated_at": 1790074657405
+ },
+ {
+  "book_id": "63703b60-c8a6-4cbd-9055-91ea259b72d1",
+  "role": "editor",
+  "name": "文字编辑",
+  "system_prompt": "提升画面感和对白张力，但不擅自改变核心剧情。",
+  "model": "",
+  "enabled": 1,
+  "updated_at": 1790074657481
+ },
+ {
+  "book_id": "a1f9e10f-e1d6-48d4-b02b-308fa27b8fda",
+  "role": "planner",
+  "name": "剧情策划",
+  "system_prompt": "负责主题、结构、大纲与章节目标，只提出可执行的剧情方案。",
+  "model": "",
+  "enabled": 1,
+  "updated_at": 1790129965786
+ },
+ {
+  "book_id": "a1f9e10f-e1d6-48d4-b02b-308fa27b8fda",
+  "role": "character",
+  "name": "人物导演",
+  "system_prompt": "负责人设、人物弧光、关系与角色行为一致性。",
+  "model": "",
+  "enabled": 1,
+  "updated_at": 1790129965786
+ },
+ {
+  "book_id": "a1f9e10f-e1d6-48d4-b02b-308fa27b8fda",
+  "role": "continuity",
+  "name": "连续性审校",
+  "system_prompt": "负责时间线、设定、伏笔、事实证据与跨章一致性。",
+  "model": "",
+  "enabled": 1,
+  "updated_at": 1790129965786
+ },
+ {
+  "book_id": "a1f9e10f-e1d6-48d4-b02b-308fa27b8fda",
+  "role": "editor",
+  "name": "文字编辑",
+  "system_prompt": "负责正文表达、节奏、对白、删改与最终质量，不擅自改变核心剧情。",
+  "model": "",
+  "enabled": 1,
+  "updated_at": 1790129965786
+ }
+]
