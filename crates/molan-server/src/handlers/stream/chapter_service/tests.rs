@@ -89,6 +89,21 @@ async fn draft_lands_in_review_with_bound_receipt() {
     // 审核报告绑定落盘 hash（mock 审核通过）
     assert_eq!(r["review"]["bodyHash"].as_str().unwrap(), hash);
     assert_eq!(r["review"]["ok"], json!(true));
+    // 上下文清单含技能快照列（§6/§8.4 可追责）
+    let man = db
+        .q_json(
+            "SELECT skills_json FROM context_manifest WHERE book_id=?1 AND command='manual_draft' AND target_ch=1",
+            &[&book as &dyn rusqlite::ToSql],
+        )
+        .unwrap();
+    // TEXT 列经 q_json 回传为字符串：解析后再断言（与 coverage_json 消费方式一致）
+    let snap: Value =
+        serde_json::from_str(man[0]["skillsJson"].as_str().unwrap_or("null")).unwrap();
+    assert!(
+        !man.is_empty() && snap.is_array(),
+        "skills_json 应为数组: {:?}",
+        man
+    );
     // 草稿溯源登记 manual-draft；重复起草必须被拒
     let o = db
         .q_json(

@@ -174,6 +174,8 @@ async fn main() {
         secure_cookies: auth::secure_cookies_for(&trusted_scheme),
     });
 
+    // 重启恢复（交接 §8.6）：已定稿但记忆仍 pending 的章补发抽取（幂等、在飞去重）
+    handlers::stream::chapter_service::spawn_boot_memory_sweep(state.clone());
     // 定期清理过期会话，避免长期运行内存增长。
     {
         let st = state.clone();

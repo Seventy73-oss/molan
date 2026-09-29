@@ -518,7 +518,9 @@ pub(crate) async fn chat_stream(
     let mut cont_count = 0u32;
     // 重试/续写数值集中在 molan-llm::retry::RetryPolicy（与生产现状一致，可单测）
     // 作者未选择时不自动继续生成额外文本；仅无产出时保留瞬态重试。
-    let mut retry_policy = molan_llm::retry::RetryPolicy::default();
+    let retry_cfg = molan_llm::get_setting(db, "agent_retry_extra");
+    let extra_n: usize = retry_cfg.parse().unwrap_or(2).min(3); // §10：额外 N 次可配（含 0）
+    let mut retry_policy = molan_llm::retry::RetryPolicy::with_extra_retries(extra_n);
     if a("autoContinue").as_bool() != Some(true) {
         retry_policy.continuation_max = 0;
     }

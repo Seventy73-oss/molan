@@ -446,6 +446,7 @@
       setBadge(card, '已确认入库', 'ok');
     } else if (art.kind === 'body_draft') {
       hd.appendChild(el('span', null, '正文草稿 · 第' + art.ch + '章'));
+      if (art.hash) card.setAttribute('data-hash', String(art.hash));
       meta((art.group || '正文待审') + '/' + (art.name || '') + ' · ' + (art.chars != null ? art.chars : '?') + ' 字 · hash ' + shortHash(art.hash) + '…（草稿≠定稿）');
       const rv = art.review;
       if (rv && rv.ok === true) meta('剧情审核：通过');
@@ -602,7 +603,7 @@
     let pend = null, props = null;
     try { pend = await ipc('list_pending_chapters', { bookId: S.bookId }); } catch (e) {}
     try { props = await ipc('dw_list_proposals', { bookId: S.bookId, status: 'pending' }); } catch (e) {}
-    const pendChs = new Set((Array.isArray(pend) ? pend : []).filter((r) => r && r.status === 'pending').map((r) => Number(r.ch)));
+    const pendMap = new Map((Array.isArray(pend) ? pend : []).filter((r) => r && r.status === 'pending').map((r) => [Number(r.ch), r.contentHash || '']));
     const propIds = new Set((Array.isArray(props) ? props : []).map((p) => String(p.id)));
     const cards = msgsEl.querySelectorAll('.wxag__card[data-kind]');
     Array.prototype.forEach.call(cards, (card) => {
@@ -619,9 +620,14 @@
       } else if (kind === 'body_draft') {
         const ch = Number(card.getAttribute('data-ch'));
         const body = chapterField(ch, 'body');
+        const ph = pendMap.get(ch);
         if (body === 'approved') setBadge(card, '已定稿', 'ok');
-        else if (pendChs.has(ch)) setBadge(card, '待审阅', 'pend');
-        else setBadge(card, '已处理或状态待核对', '');
+        else if (ph !== undefined) {
+          // §5.5：报告绑定所审版本；正文被改 → 旧报告失效，必须重审而不是沿用
+          const ah = card.getAttribute('data-hash');
+          if (ah && ph && ph !== ah) setBadge(card, '正文已改动，旧审核报告失效', 'fail');
+          else setBadge(card, '待审阅', 'pend');
+        } else setBadge(card, '已处理或状态待核对', '');
       }
     });
   }
@@ -978,6 +984,26 @@
     } else if (rows === null) {
       addNote('历史加载失败：状态待核对（不影响发送）', 'wxag__note--fail');
     }
+    // 在飞 run（M2 §6）：刷新后如实告知「上一轮未结束」，可按其 requestId 停止；不自动续看/重发
+    try {
+      const ss = await ipc('agent_session_state', { bookId: S.bookId, sessionId: S.sessionId });
+      const run = ss && ss.run;
+      if (run && run.status === 'running' && run.requestId) {
+        const n = addNote('上一轮运行仍在进行（' + String(run.requestId).slice(0, 8) + '…）：刷新不自动续看，可停止或等它结束', 'wxag__note--accent');
+        const sb = el('button', 'wxag__qbtn', '停止上一轮');
+        sb.onclick = async () => {
+          sb.disabled = true;
+          try {
+            await ipc('abort_chat', { requestId: run.requestId });
+            n.appendChild(el('span', null, '（已发停止请求，等后端终态）'));
+          } catch (e) {
+            sb.disabled = false;
+            n.appendChild(el('span', null, '（停止失败：' + errText(e) + '）'));
+          }
+        };
+        n.appendChild(sb);
+      }
+    } catch (e) {}
     await refreshStrip();
     reconcile();
   }

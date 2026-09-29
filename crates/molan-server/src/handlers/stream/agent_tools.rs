@@ -56,7 +56,7 @@ pub(crate) fn tool_catalog() -> Value {
         {"type":"function","function":{
             "name":"confirm_chapter_outline","description":"仅当作者明确表示「这个细纲可以，入库/确认」时调用：把该章细纲当前内容绑定为已确认版本，返回真实回执。expectedHash 传作者看过那一版的 hash（来自 read_book_file / draft_chapter_outline 回执）；期间被改则拒绝。绝不代替作者决定确认。","parameters":{"type":"object","properties":{"ch":{"type":"integer"},"expectedHash":{"type":"string","description":"作者看过版本的 contentHash（可省略=绑定当前内容）"}},"required":["ch"]}}},
         {"type":"function","function":{
-            "name":"draft_chapter_body","description":"仅当作者明确要求写正文时调用：前置检查（细纲已确认且未失效、无既有稿件、前序记忆无阻塞、上一章已定稿）通过后生成第 ch 章正文草稿，自动去AI味并做剧情审核，落「正文待审」+审批队列。草稿≠定稿。耗时较长。","parameters":{"type":"object","properties":{"ch":{"type":"integer"},"instruction":{"type":"string","description":"本轮特别要求（可选）"}},"required":["ch"]}}},
+            "name":"draft_chapter_body","description":"仅当作者明确要求写正文时调用：前置检查（细纲已确认且未失效、无既有稿件、前序记忆无阻塞、上一章已定稿）通过后生成第 ch 章正文草稿，自动去AI味并做剧情审核，落「正文待审」+审批队列。草稿≠定稿。耗时较长。","parameters":{"type":"object","properties":{"ch":{"type":"integer"},"instruction":{"type":"string","description":"本轮特别要求（可选）"},"skillIds":{"type":"array","items":{"type":"string"},"description":"本次临时技能覆盖（id 或名字；只影响本轮，不改默认绑定）"}},"required":["ch"]}}},
         {"type":"function","function":{
             "name":"finalize_chapter_draft","description":"仅当作者明确表示「这个版本定稿」时调用：按 expectedHash 绑定作者审阅过的待审版本执行定稿（与审批按钮同一核心动作），故事记忆自动排队同步。hash 不匹配即拒绝。绝不代替作者决定定稿。","parameters":{"type":"object","properties":{"ch":{"type":"integer"},"expectedHash":{"type":"string","description":"必填：作者审阅版本的 contentHash（来自 draft_chapter_body 回执或 list_pending_chapters）"}},"required":["ch","expectedHash"]}}}
     ])
@@ -297,15 +297,38 @@ pub(crate) async fn dispatch_tool_io(
             .get("instruction")
             .and_then(Value::as_str)
             .unwrap_or("");
+        // 本次技能覆盖（§6.3 临时作用域）：只影响本轮，不写任何默认绑定
+        // skillIds 接受数组或逗号分隔串（mock 工具协议参数内不能含 ]，数组写法测不了）
+        let skill_ids: Vec<String> = match args.get("skillIds") {
+            Some(v) if v.is_array() => v
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            Some(v) => v
+                .as_str()
+                .unwrap_or("")
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            None => Vec::new(),
+        };
         // root 供 prompts/文风档案解析：data_dir = root/data（main.rs 构造恒等式）
         let root = db.data_dir.parent().unwrap_or(&db.data_dir);
         let emit = super::chapter_service::Emit::new(tx, channel);
+        let opts = super::chapter_service::DraftOpts {
+            instruction,
+            skill_ids: &skill_ids,
+        };
         return super::chapter_service::draft_chapter(
             db,
             root,
             book_id,
             ch,
-            instruction,
+            &opts,
             cancel.clone(),
             &emit,
         )

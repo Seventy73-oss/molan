@@ -130,6 +130,12 @@ fn preflight(db: &Db, book_id: &str, ch: i64) -> Result<(String, String, (i64, S
     Ok((oname, outline_hash, (ch + 1, fp)))
 }
 
+/// 起草选项：本轮特别要求 + 本次技能覆盖（§8.4 三作用域：作品默认/阶段默认/本次临时）。
+pub(crate) struct DraftOpts<'a> {
+    pub instruction: &'a str,
+    pub skill_ids: &'a [String],
+}
+
 /// 单章正文起草：前置检查 → 生成 → 去AI味 → 落「正文待审」+ 队列/溯源记账 → 剧情审核 → 回执。
 /// 返回 body_draft 工件（MANUAL-LINE-CONTRACT §2）；任何失败都不落盘、返回中文原因。
 pub(crate) async fn draft_chapter(
@@ -137,7 +143,7 @@ pub(crate) async fn draft_chapter(
     root: &std::path::Path,
     book_id: &str,
     ch: i64,
-    instruction: &str,
+    opts: &DraftOpts<'_>,
     cancel: CancellationToken,
     emit: &Emit<'_>,
 ) -> Result<Value> {
@@ -171,7 +177,9 @@ pub(crate) async fn draft_chapter(
             })
         });
     let style = super::resolve_book_style(db, root, book_id, genre.as_deref());
-    let skills = super::effective_skills(db, book_id, "body", &[]);
+    // 技能三作用域（§6.3）：本次临时覆盖只影响本轮，不改书级/阶段默认绑定
+    let explicit: Vec<Value> = opts.skill_ids.iter().map(|s| json!(s)).collect();
+    let skills = super::effective_skills(db, book_id, "body", &explicit);
     let mut context = super::auto_book_context_for_chapter(db, book_id, ch, false);
     if context.is_empty() {
         context = format!(
@@ -180,10 +188,14 @@ pub(crate) async fn draft_chapter(
         );
     }
     super::stage_context::append_target_outline(db, book_id, ch, &mut context);
-    let msg = if instruction.trim().is_empty() {
+    let msg = if opts.instruction.trim().is_empty() {
         format!("写第{}章正文。", ch)
     } else {
-        format!("写第{}章正文。本轮特别要求：{}", ch, instruction.trim())
+        format!(
+            "写第{}章正文。本轮特别要求：{}",
+            ch,
+            opts.instruction.trim()
+        )
     };
     let mut sys = super::build_system(
         db,
@@ -229,7 +241,12 @@ pub(crate) async fn draft_chapter(
     } else {
         Value::Null
     };
-    let _ = molan_core::ctx_manifest::record(
+    // 上下文清单 + 技能快照（§6/§8.4）：实际注入与所用技能版本可追责
+    let skill_snap = json!(skills
+        .iter()
+        .map(|sk| json!({"id": sk["id"], "name": sk["name"], "rev": sk["rev"]}))
+        .collect::<Vec<_>>());
+    if let Ok(mid) = molan_core::ctx_manifest::record(
         db,
         book_id,
         "",
@@ -238,7 +255,9 @@ pub(crate) async fn draft_chapter(
         &model,
         &context,
         coverage,
-    );
+    ) {
+        let _ = molan_core::ctx_manifest::attach_skills(db, &mid, &skill_snap);
+    }
 
     emit.ev(json!({"type":"step","index":2,"title":"生成正文（按已确认细纲）"}))
         .await;
@@ -348,12 +367,14 @@ pub(crate) async fn draft_chapter(
     let cancel2 = cancel.clone();
     let oname2 = outline_name.clone();
     let book2 = book_id.to_string();
+    // §8 保留原稿与差异：先落去味前原稿，再用 CAS 覆盖为去味稿——
+    // 版本快照因此保留原稿（编辑器可对比差异）；CAS 保证覆盖前无人改过
     files::write_ai_file_checked(
         db,
         book_id,
         molan_core::db::REVIEW_GROUP,
         &name,
-        &final_body,
+        &body,
         move || {
             // 锁内复核：取消 / 细纲确认仍有效 / 依赖指纹未变——任一失效即拒绝落盘。
             if cancel2.is_cancelled() {
@@ -369,6 +390,16 @@ pub(crate) async fn draft_chapter(
             Ok(())
         },
     )?;
+    if final_body != body {
+        files::write_file_cas(
+            db,
+            book_id,
+            molan_core::db::REVIEW_GROUP,
+            &name,
+            &body,
+            &final_body,
+        )?;
+    }
     let hash = continuity::content_hash(&final_body);
     // 队列登记失败必须报错：文件已写但队列没有 = 作者看不到这篇稿。
     crate::handlers::register_review_queue(db, book_id, &name, &final_body)?;
@@ -437,6 +468,10 @@ pub(crate) async fn draft_chapter(
         "hash": hash, "chars": final_body.chars().count(),
         "outline": {"name": outline_name, "hash": outline_hash},
         "review": review_summary, "humanize": humanize_brief, "model": model,
+        "skillIds": skill_snap
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v["id"].as_str()).collect::<Vec<_>>())
+            .unwrap_or_default(),
         "note": "草稿已进入「正文待审」并登记审批队列；不是定稿。请审阅后定稿或退回。",
     }))
 }
@@ -479,17 +514,21 @@ pub(crate) async fn draft_chapter_stream(
         }
     }
     let _guard = AbortGuard(&key);
-    match draft_chapter(
-        db,
-        &st.root,
-        &book_id,
-        ch,
-        &s("instruction"),
-        cancel.clone(),
-        &emit,
-    )
-    .await
-    {
+    // 本次技能覆盖（§6.3 临时作用域）：面板/IPC 与 Agent 工具同权
+    let skill_ids: Vec<String> = a("skillIds")
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let instruction = s("instruction");
+    let opts = DraftOpts {
+        instruction: &instruction,
+        skill_ids: &skill_ids,
+    };
+    match draft_chapter(db, &st.root, &book_id, ch, &opts, cancel.clone(), &emit).await {
         Ok(receipt) => {
             emit.ev(json!({"type":"done","receipt":receipt.clone()}))
                 .await;
@@ -599,6 +638,25 @@ pub(crate) fn finalize_draft(
         "memorySync": "queued",
         "note": "已定稿；故事记忆已排队同步（进度/失败见生产线状态）",
     }))
+}
+
+/// 重启恢复（§8.6）：启动时把全书「已定稿但记忆仍 pending」的章补发抽取。
+/// 与 agent_turn 收尾共用 sweep_pending_memory（幂等 + 在飞去重）。
+pub(crate) fn spawn_boot_memory_sweep(st: Arc<AppState>) {
+    tokio::spawn(async move {
+        let books = st
+            .db
+            .q_json(
+                "SELECT DISTINCT book_id FROM memory_job WHERE status='pending'",
+                &[],
+            )
+            .unwrap_or_default();
+        for b in books {
+            if let Some(id) = b["bookId"].as_str() {
+                sweep_pending_memory(&st, id).await;
+            }
+        }
+    });
 }
 
 /// 在飞记忆同步去重：sweep/工具/按钮并发时同一 (book,ch) 只 spawn 一次。

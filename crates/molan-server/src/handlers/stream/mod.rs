@@ -1466,6 +1466,24 @@ pub async fn dispatch_stream(
         "auto_write_last_task" => return auto_write::auto_write_last_task(st, cmd, args, tx).await,
         // Agent 对话（工具循环，独立于 chat_stream）
         "agent_turn" => return agent_loop::agent_turn(st, cmd, args, tx).await,
+        // M2（FRONTEND §6）：带归属校验的运行查询——刷新后如实知道「是否有在飞 run」，不猜不自动重发
+        "agent_session_state" => {
+            let book_id = s("bookId");
+            let session_id = s("sessionId");
+            let owned = db
+                .q_json(
+                    "SELECT book_id FROM sessions WHERE id=?1",
+                    &[&session_id as &dyn rusqlite::ToSql],
+                )
+                .unwrap_or_default();
+            if session_id.is_empty()
+                || owned.first().and_then(|r| r["bookId"].as_str()) != Some(book_id.as_str())
+            {
+                return Err(anyhow!("会话不存在或不属于当前书"));
+            }
+            let run = molan_core::agent_run::latest_run_for_session(db, &session_id)?;
+            Ok(Some(json!({ "run": run })))
+        }
         // ============ 手动线（作者逐章确认）：单章正文起草 + 细纲确认 ============
         "draft_chapter" => return chapter_service::draft_chapter_stream(st, cmd, args, tx).await,
         "confirm_outline" => {

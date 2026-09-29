@@ -27,6 +27,20 @@ pub fn ensure_schema(db: &Db) -> Result<()> {
              CREATE INDEX IF NOT EXISTS idx_ctx_manifest_book ON context_manifest(book_id, ts);
              CREATE INDEX IF NOT EXISTS idx_ctx_manifest_session ON context_manifest(session_id, ts);",
         )?;
+    // additive 迁移：技能快照列（§6「记录实际使用的技能 ID 和版本」；旧库补列，旧二进制可读）
+    let cols = db.q_json(
+        "SELECT name FROM pragma_table_info('context_manifest')",
+        &[],
+    )?;
+    if !cols
+        .iter()
+        .any(|c| c["name"].as_str() == Some("skills_json"))
+    {
+        db.exec(
+            "ALTER TABLE context_manifest ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]'",
+            &[],
+        )?;
+    }
     Ok(())
 }
 
@@ -108,6 +122,16 @@ pub fn record(
         ],
     )?;
     Ok(id)
+}
+
+/// 把本轮生效技能快照（id/name/rev）绑到清单：「写作时用了哪版技能」可追责（§6/§8.4）。
+/// get_effective_skills 查询不等于已加载——只有实际注入生成的轮次才写快照。
+pub fn attach_skills(db: &Db, manifest_id: &str, skills: &Value) -> Result<()> {
+    db.exec(
+        "UPDATE context_manifest SET skills_json=?2 WHERE id=?1",
+        &[&manifest_id as &dyn rusqlite::ToSql, &skills.to_string()],
+    )?;
+    Ok(())
 }
 
 /// 列表：按书或会话过滤，新的在前。不带 blocks 全文（太大），只带统计。
@@ -216,5 +240,36 @@ mod tests {
         assert_eq!(l["manifests"].as_array().unwrap().len(), 1);
         let l2 = list(&db, "", "sess1", 10).unwrap();
         assert_eq!(l2["manifests"].as_array().unwrap().len(), 1);
+    }
+
+    /// §6/§8.4：技能快照可绑定到清单行（additive 列迁移后旧库也可写）
+    #[test]
+    fn skills_snapshot_attaches_to_manifest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        let id = record(
+            &db,
+            "b",
+            "s",
+            "manual_draft",
+            1,
+            "m",
+            "【x】内容",
+            json!(null),
+        )
+        .unwrap();
+        attach_skills(&db, &id, &json!([{"id":"sk1","name":"三幕结构","rev":2}])).unwrap();
+        let row = db
+            .q_json(
+                "SELECT skills_json FROM context_manifest WHERE id=?1",
+                &[&id as &dyn rusqlite::ToSql],
+            )
+            .unwrap();
+        // TEXT 列经 q_json 回传为字符串：解析后再比（与 coverage_json 的消费方式一致）
+        let raw = row[0]["skillsJson"].as_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(raw).unwrap(),
+            json!([{"id":"sk1","name":"三幕结构","rev":2}])
+        );
     }
 }

@@ -11,6 +11,15 @@ pub struct RetryPolicy {
     pub continuation_backoff_ms: u64,
 }
 
+impl RetryPolicy {
+    /// 交接 §10：重试次数语义明确——首次请求之外额外 N 次；允许设置 0（截断退避序列）。
+    pub fn with_extra_retries(n: usize) -> Self {
+        let mut p = Self::default();
+        p.transient_delays_ms.truncate(n);
+        p
+    }
+}
+
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {

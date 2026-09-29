@@ -286,7 +286,13 @@ pub(crate) async fn run_agent_turn(
     cx.ev(json!({"type":"meta","task":"agent","model":model,"runId":run_id,"tools":tools_count}))
         .await;
 
-    let retry = molan_llm::retry::RetryPolicy::default();
+    // §10：重试次数可配置（首次之外额外 N 次，含 0）；只同模型退避，绝不换模型
+    let extra: usize = molan_llm::get_setting(db, "agent_retry_extra")
+        .parse()
+        .ok()
+        .filter(|n: &usize| *n <= 3)
+        .unwrap_or(2);
+    let retry = molan_llm::retry::RetryPolicy::with_extra_retries(extra);
     let mut retries: u32 = 0;
     let mut full = String::new();
     let mut steps: Vec<Value> = Vec::new();

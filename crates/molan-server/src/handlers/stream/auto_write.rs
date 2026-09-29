@@ -2869,7 +2869,13 @@ pub(crate) async fn auto_humanize(
     let mut cur = body.to_string();
     let mut round = 0i64;
     let mut shrink_retry = false;
-    while round < 2 {
+    // 交接 §8：修订轮次可配置；实施决定最终默认=1 轮表达修订（文档候选值），0..=3 可调
+    let max_rounds: i64 = molan_llm::get_setting(db, "humanize_max_rounds")
+        .parse()
+        .ok()
+        .filter(|n: &i64| (0..=3).contains(n))
+        .unwrap_or(1);
+    while round < max_rounds {
         let viols = report["violations"].as_array().cloned().unwrap_or_default();
         // v2.4：凡是不及格（>32）且有命中项即触发修复。原实现只认 tier1/2/5，
         // 导致只有 tier3/tier4（酒馆腔/模板句/明喻·副词·眼神密度等）命中时「报告超线却不去味」。

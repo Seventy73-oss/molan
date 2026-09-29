@@ -59,7 +59,9 @@ pub(crate) fn append_target_outline(
         return None;
     }
     let name = target_outline_name(db, book_id, target_ch)?;
-    if context.contains(&name) || files::file_flag(db, book_id, "细纲", &name, "aiOff") {
+    // 去重按「注入标记」而非文件名子串（§7 稳定引用）：作者正文里提到文件名不算已注入
+    let marker = format!("【本章细纲·第{}章·{}", target_ch, name);
+    if context.contains(&marker) || files::file_flag(db, book_id, "细纲", &name, "aiOff") {
         return None;
     }
     let content = files::read_file(db, book_id, "细纲", &name)?;
@@ -69,11 +71,20 @@ pub(crate) fn append_target_outline(
     if !context.is_empty() {
         context.push_str("\n\n");
     }
+    // 截断绝不静默（§7）：超预算时显式注明注入/省略字数并指引回读
+    let total = content.chars().count();
+    let taken: String = content.chars().take(3000).collect();
+    let cut = if total > 3000 {
+        format!(
+            "（细纲过长已截断：注入3000字，省略{}字；关键场景请回读原文）",
+            total - 3000
+        )
+    } else {
+        String::new()
+    };
     context.push_str(&format!(
-        "【本章细纲·第{}章·{}（正文必须按此展开；要偏离先问作者）】\n{}",
-        target_ch,
-        name,
-        content.chars().take(3000).collect::<String>()
+        "{}（正文必须按此展开；要偏离先问作者）】\n{}{}",
+        marker, taken, cut
     ));
     Some(name)
 }
@@ -166,6 +177,20 @@ mod tests {
             text.contains("MARKER_OUTLINE"),
             "string entry must inject: {}",
             text
+        );
+    }
+
+    #[test]
+    fn long_outline_truncation_is_declared_not_silent() {
+        let (_d, db, bid) = setup();
+        let long = "X".repeat(4000);
+        files::write_file(&db, &bid, "细纲", "第1章细纲.md", &long).unwrap();
+        let mut ctx = String::new();
+        append_target_outline(&db, &bid, 1, &mut ctx);
+        assert!(
+            ctx.contains("注入3000字，省略1000字"),
+            "截断必须显式声明：{}",
+            &ctx[..80.min(ctx.len())]
         );
     }
 
