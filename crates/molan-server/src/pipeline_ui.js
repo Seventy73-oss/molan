@@ -7,9 +7,9 @@
 //     确认细纲入库=confirm_outline、起草正文=draft_chapter（流式，与 Agent 工具同一服务）、
 //     记忆重跑=rebuild_memory；其余阶段仍走既有 store 显式通道。
 //
-// 设计语言（任务 A）：白底 / 1px 浅灰分隔线 #ececec / 无卡片堆叠阴影 / 圆角 8px /
-// 系统字体栈 / 13px 正文 12px 辅助 / 行高 1.6 / 留白 14-16px；单强调色琥珀 #d97706
-// 仅用于主按钮与待办标记；状态色收敛为 绿#16a34a(完成) 灰#9ca3af(未做) 琥珀(待处理) 红#dc2626(失败)。
+// 设计语言「墨韵·简白」：纸面底 #fbfaf8 / 发丝线 #e6e1d8 / 墨色正文 #201d1a / 朱砂品牌色 #b3402a；
+// 衬线标题（Songti/Georgia）+ 系统无衬线正文；圆角 10-14px；极浅投影；状态色左规线卡片；
+// 状态色：苔绿 #2f7d4f(完成) 暖灰 #b8b2a9(未做) 琥珀 #b45309(待处理) 朱红 #c02626(失败)；toast 墨底纸字。
 //
 // 依赖：glue 已定义 window.__TAURI_INTERNALS__，本脚本由服务器注入在 glue 之后
 // （main.rs include_str!，见文件末尾 __WX_PIPELINE_UI_API__ 导出说明）。
@@ -28,21 +28,15 @@
   const ipc = (cmd, args) => origInvoke.call(internals, cmd, args || {});
   const doc = document;
 
-  // ============ 设计 tokens ============
+  // ============ 设计 tokens「墨韵·简白」（与 agent_ui.js 完全一致；panelW 两面板相同，ui-check 断言） ============
   const T = {
-    bg: '#ffffff',
-    line: '#ececec',
-    lineSoft: '#f6f6f6',
-    text: '#1f2328',
-    text2: '#6b7280',
-    text3: '#9ca3af',
-    accent: '#d97706',
-    ok: '#16a34a',
-    todo: '#9ca3af',
-    pending: '#d97706',
-    fail: '#dc2626',
+    bg: '#fbfaf8', bgDeep: '#f3f0ea',
+    line: '#e6e1d8', lineSoft: '#efece6',
+    text: '#201d1a', text2: '#5f5a52', text3: '#9a938b',
+    accent: '#b3402a', ok: '#2f7d4f', todo: '#b8b2a9', pending: '#b45309', fail: '#c02626',
     font: '-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif',
-    panelW: 360,
+    serif: 'Georgia,"Songti SC","STSong","Noto Serif SC",serif',
+    panelW: 380,
   };
 
   const ROLE_LABELS = { outline: '细纲', chapter: '正文', review: '审读', summary: '总结', distill: '蒸馏', chat: '聊天' };
@@ -63,60 +57,62 @@
     const st = el('style');
     st.id = STYLE_ID;
     st.textContent = [
-      '#__wx_pipeline_panel{position:fixed;right:0;top:64px;bottom:20px;width:' + T.panelW + 'px;box-sizing:border-box;',
-      'background:' + T.bg + ';border:1px solid ' + T.line + ';border-right:none;border-radius:8px 0 0 8px;',
-      'font-family:' + T.font + ';font-size:13px;line-height:1.6;color:' + T.text + ';z-index:10001;',
-      'display:flex;flex-direction:column;overflow:hidden}',
-      '.wxpipe__hd{display:flex;align-items:center;gap:8px;padding:14px 14px 12px;border-bottom:1px solid ' + T.line + '}',
-      '.wxpipe__title{font-size:13px;font-weight:600}',
+      '#__wx_pipeline_panel{position:fixed;right:0;top:56px;bottom:16px;width:' + T.panelW + 'px;max-width:100vw;box-sizing:border-box;',
+      'background:' + T.bg + ';border:1px solid ' + T.line + ';border-right:none;border-radius:14px 0 0 14px;',
+      'font-family:' + T.font + ';font-size:13px;line-height:1.65;color:' + T.text + ';z-index:10001;',
+      'display:flex;flex-direction:column;overflow:hidden;box-shadow:-6px 0 24px rgba(32,29,26,.06)}',
+      '.wxpipe__hd{display:flex;align-items:center;gap:8px;padding:13px 16px 11px;border-bottom:1px solid ' + T.line + ';background:' + T.bgDeep + '}',
+      '.wxpipe__seal{width:9px;height:9px;border-radius:2.5px;background:' + T.accent + ';flex:none}',
+      '.wxpipe__title{font-size:14px;font-weight:600;font-family:' + T.serif + ';letter-spacing:.03em}',
       '.wxpipe__hdact{margin-left:auto;display:flex;gap:2px}',
       '.wxpipe__icon{border:none;background:transparent;color:' + T.text3 + ';font-family:inherit;font-size:12px;',
-      'line-height:1.6;padding:3px 6px;border-radius:6px;cursor:pointer}',
+      'line-height:1.6;padding:3px 7px;border-radius:7px;cursor:pointer}',
       '.wxpipe__icon:hover{background:' + T.lineSoft + ';color:' + T.text + '}',
-      '.wxpipe__body{flex:1;overflow-y:auto;padding:0 14px 16px}',
-      '.wxpipe__agent{margin:12px 0 2px;width:100%;box-sizing:border-box;border:1px solid ' + T.accent + ';background:' + T.bg + ';',
-      'color:' + T.accent + ';font-family:inherit;font-size:12px;line-height:1.6;padding:7px 10px;border-radius:8px;cursor:pointer}',
-      '.wxpipe__agent:hover{background:#fffaf2}',
-      '.wxpipe__agent[disabled]{border-color:' + T.line + ';color:' + T.text3 + ';cursor:not-allowed;background:' + T.bg + '}',
-      '.wxpipe__sec{padding:14px 0 0;font-size:12px;color:' + T.text3 + ';letter-spacing:.02em}',
-      '.wxpipe__row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid ' + T.lineSoft + '}',
-      '.wxpipe__dot{width:7px;height:7px;border-radius:50%;flex:none;background:' + T.todo + '}',
-      '.wxpipe__name{font-size:13px;color:' + T.text + '}',
-      '.wxpipe__mks{margin-left:auto;display:flex;gap:8px;align-items:center;flex:none}',
-      '.wxpipe__mk{display:inline-flex;align-items:center;gap:3px;font-size:11.5px;color:' + T.text3 + '}',
-      '.wxpipe__mkdot{width:5px;height:5px;border-radius:50%;flex:none;display:inline-block}',
-      '.wxpipe__unverified{font-size:11.5px;color:' + T.text3 + '}',
+      '.wxpipe__body{flex:1;overflow-y:auto;padding:0 16px 18px}',
+      '.wxpipe__agent{margin:14px 0 2px;width:100%;box-sizing:border-box;border:1px solid ' + T.text + ';background:' + T.text + ';',
+      'color:' + T.bg + ';font-family:' + T.serif + ';font-size:12.5px;line-height:1.6;padding:8px 12px;border-radius:9px;cursor:pointer;letter-spacing:.06em}',
+      '.wxpipe__agent:hover{background:' + T.accent + ';border-color:' + T.accent + ';color:#fff}',
+      '.wxpipe__agent[disabled]{border-color:' + T.line + ';color:' + T.text3 + ';cursor:not-allowed;background:' + T.bgDeep + '}',
+      '.wxpipe__sec{padding:16px 0 4px;font-size:10.5px;color:' + T.text3 + ';letter-spacing:.16em}',
+      '.wxpipe__row{display:flex;align-items:center;gap:9px;padding:7px 0;border-bottom:1px solid ' + T.lineSoft + '}',
+      '.wxpipe__dot{width:7px;height:7px;border-radius:50%;flex:none;background:' + T.todo + ';box-shadow:0 0 0 1px ' + T.bg + '}',
+      '.wxpipe__name{font-size:13px;color:' + T.text + ';font-family:' + T.serif + '}',
+      '.wxpipe__mks{margin-left:auto;display:flex;gap:9px;align-items:center;flex:none}',
+      '.wxpipe__mk{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:' + T.text3 + '}',
+      '.wxpipe__mkdot{width:6px;height:6px;border-radius:50%;flex:none;display:inline-block}',
+      '.wxpipe__unverified{font-size:10.5px;color:' + T.text3 + ';border:1px solid ' + T.line + ';border-radius:999px;padding:0 6px}',
       '.wxpipe__more{display:block;width:100%;text-align:left;border:none;background:transparent;color:' + T.text3 + ';',
-      'font-family:inherit;font-size:12px;line-height:1.6;padding:8px 0 0;cursor:pointer}',
+      'font-family:inherit;font-size:12px;line-height:1.6;padding:9px 0 0;cursor:pointer}',
       '.wxpipe__more:hover{color:' + T.accent + '}',
-      '.wxpipe__count{padding:8px 0 0;font-size:11.5px;color:' + T.text3 + '}',
-      '.wxpipe__blocker{padding:10px 0 0;font-size:12px;color:' + T.accent + '}',
-      '.wxpipe__next{padding:12px 0 0}',
-      '.wxpipe__primary{display:block;width:100%;box-sizing:border-box;border:1px solid ' + T.accent + ';background:' + T.accent + ';',
-      'color:#fff;font-family:inherit;font-size:13px;line-height:1.6;padding:8px 12px;border-radius:8px;cursor:pointer}',
-      '.wxpipe__primary:hover{background:#c2660a;border-color:#c2660a}',
-      '.wxpipe__hint{padding:8px 0 0;font-size:11.5px;color:' + T.text3 + '}',
+      '.wxpipe__count{padding:9px 0 0;font-size:11px;color:' + T.text3 + ';letter-spacing:.02em}',
+      '.wxpipe__blocker{padding:11px 0 0;font-size:12px;color:' + T.pending + '}',
+      '.wxpipe__next{padding:14px 0 0}',
+      '.wxpipe__primary{display:block;width:100%;box-sizing:border-box;border:1px solid ' + T.text + ';background:' + T.text + ';',
+      'color:' + T.bg + ';font-family:' + T.serif + ';font-size:13px;line-height:1.6;padding:9px 12px;border-radius:10px;cursor:pointer;letter-spacing:.05em}',
+      '.wxpipe__primary:hover{background:' + T.accent + ';border-color:' + T.accent + ';color:#fff}',
+      '.wxpipe__hint{padding:8px 0 0;font-size:11px;color:' + T.text3 + '}',
       '.wxpipe__hint--ok{color:' + T.ok + '}',
-      '.wxpipe__aux{display:flex;flex-wrap:wrap;gap:12px;padding:8px 0 0}',
+      '.wxpipe__aux{display:flex;flex-wrap:wrap;gap:14px;padding:10px 0 0}',
       '.wxpipe__link{border:none;background:transparent;color:' + T.text2 + ';font-family:inherit;font-size:12px;',
-      'line-height:1.6;padding:0;cursor:pointer;text-decoration:underline;text-decoration-color:' + T.line + '}',
-      '.wxpipe__link:hover{color:' + T.accent + '}',
-      '.wxpipe__empty{padding:14px 0;font-size:12px;color:' + T.text3 + '}',
-      '.wxpipe__err{padding:14px 0;font-size:12px;color:' + T.fail + '}',
+      'line-height:1.6;padding:0;cursor:pointer;text-decoration:underline;text-decoration-color:' + T.line + ';text-underline-offset:3px}',
+      '.wxpipe__link:hover{color:' + T.accent + ';text-decoration-color:' + T.accent + '}',
+      '.wxpipe__empty{padding:16px 0;font-size:12px;color:' + T.text3 + '}',
+      '.wxpipe__err{padding:16px 0;font-size:12px;color:' + T.fail + '}',
       // 收起态：只是一个细条按钮
       '#__wx_pipeline_entry{position:fixed;right:0;top:40%;z-index:10002;border:1px solid ' + T.line + ';border-right:none;',
-      'border-radius:8px 0 0 8px;background:' + T.bg + ';color:' + T.text3 + ';font-family:' + T.font + ';',
-      'font-size:11px;line-height:1.6;padding:10px 4px;cursor:pointer;writing-mode:vertical-rl;letter-spacing:.08em}',
+      'border-radius:10px 0 0 10px;background:' + T.bg + ';color:' + T.text3 + ';font-family:' + T.serif + ';',
+      'font-size:11px;line-height:1.6;padding:12px 5px;cursor:pointer;writing-mode:vertical-rl;letter-spacing:.22em;',
+      'box-shadow:-2px 0 10px rgba(32,29,26,.05)}',
       '#__wx_pipeline_entry:hover{color:' + T.accent + ';border-color:' + T.accent + '}',
-      // 顶部居中小条 toast（白底细边框，3 秒消失；独立 id __wxpipe_toast，绝不可复用 glue 的 __wx_toast——样式叠加会把旧 toast 拉伸成全屏大黑框）
-      '#__wxpipe_toast{position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:10004;max-width:min(560px,86vw);',
-      'background:' + T.bg + ';border:1px solid ' + T.line + ';border-radius:8px;padding:9px 14px;',
-      'font-family:' + T.font + ';font-size:12px;line-height:1.6;color:' + T.text + '}',
-      '#__wx_limit_bar{position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:10003;max-width:min(680px,92vw);',
-      'display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 14px;border:1px solid ' + T.accent + ';',
-      'border-radius:8px;background:' + T.bg + ';font-family:' + T.font + ';font-size:12px;line-height:1.6;color:' + T.text + '}',
+      // 顶部居中小条 toast（墨底纸字，3 秒消失；独立 id __wxpipe_toast，绝不可复用 glue 的 __wx_toast——样式叠加会把旧 toast 拉伸成全屏大黑框）
+      '#__wxpipe_toast{position:fixed;left:50%;top:18px;transform:translateX(-50%);z-index:10004;max-width:min(560px,86vw);',
+      'background:' + T.text + ';border:none;border-radius:10px;padding:10px 16px;box-shadow:0 10px 30px rgba(32,29,26,.25);',
+      'font-family:' + T.font + ';font-size:12px;line-height:1.6;color:' + T.bg + '}',
+      '#__wx_limit_bar{position:fixed;left:50%;top:18px;transform:translateX(-50%);z-index:10003;max-width:min(680px,92vw);',
+      'display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 16px;border:1px solid ' + T.accent + ';',
+      'border-radius:10px;background:' + T.bg + ';font-family:' + T.font + ';font-size:12px;line-height:1.6;color:' + T.text + ';box-shadow:0 10px 30px rgba(32,29,26,.12)}',
       '.wxpipe__lbtn{border:1px solid ' + T.line + ';border-radius:8px;background:' + T.bg + ';color:' + T.text + ';',
-      'font-family:inherit;font-size:12px;line-height:1.6;padding:3px 9px;cursor:pointer}',
+      'font-family:inherit;font-size:12px;line-height:1.6;padding:3px 10px;cursor:pointer}',
       '.wxpipe__lbtn:hover{border-color:' + T.accent + ';color:' + T.accent + '}',
       '.wxpipe__lbtn--ghost{border-style:dashed;color:' + T.text2 + '}',
       // 面板打开时给宿主内容让位（best-effort；找不到宿主根时退化为浮层）
@@ -566,6 +562,7 @@
     panelEl = el('div');
     panelEl.id = '__wx_pipeline_panel';
     const head = el('div', 'wxpipe__hd');
+    head.appendChild(el('span', 'wxpipe__seal'));
     head.appendChild(el('span', 'wxpipe__title', '生产线'));
     const ops = el('div', 'wxpipe__hdact');
     const refresh = el('button', 'wxpipe__icon', '刷新');

@@ -23,4 +23,5 @@ crates/molan-server/src/handlers/stream/agent_loop.rs	1020
 # 手动线 M2：agent_ui.js 由运行视图升级为完整创作助手（历史恢复+对账、五类工件确认卡、
 # 状态条、快捷动作、弹窗、记忆轮询）。注入脚本需单 IIFE 共享状态，拆分要改 main.rs 注入链
 # 并引入跨文件命名空间，风险大于收益；按 glue.js 既有惯例登记，后续只减不增。
-crates/molan-server/src/agent_ui.js	1041
+# 「墨韵·简白」视觉重设计：样式表换装（纸面/发丝线/朱砂/衬线标题/状态左规线）净 +10 行。
+crates/molan-server/src/agent_ui.js	1051
