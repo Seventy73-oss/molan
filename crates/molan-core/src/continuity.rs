@@ -65,21 +65,73 @@ pub(crate) fn ensure_book(db: &Db, book: &str) -> Result<()> {
     Ok(())
 }
 
+/// 中文数字值（章名范围：个位数字）。
+fn zh_digit(c: char) -> i64 {
+    match c {
+        '一' => 1,
+        '二' => 2,
+        '三' => 3,
+        '四' => 4,
+        '五' => 5,
+        '六' => 6,
+        '七' => 7,
+        '八' => 8,
+        '九' => 9,
+        _ => 0,
+    }
+}
+
+/// 中文数字章号（十一/一百二十三/二千…）：单位累加解析，返回 (值, 消费字符数)。
+fn zh_number(cs: &[char], start: usize) -> Option<(i64, usize)> {
+    let (mut sec, mut cur, mut i) = (0i64, 0i64, start);
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '十' || c == '百' || c == '千' {
+            let unit = if c == '十' {
+                10
+            } else if c == '百' {
+                100
+            } else {
+                1000
+            };
+            sec += if cur == 0 { unit } else { cur * unit };
+            cur = 0;
+        } else if zh_digit(c) > 0 {
+            cur = zh_digit(c);
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    (sec + cur > 0 && i > start).then(|| (sec + cur, i))
+}
+
+/// 章号解析（文件名锚定）：必须以「第」开头 + 阿拉伯或中文数字 + 「章」。
+/// F3：中文数字章名（第十一章.md）批准后，记忆/依赖/批准凭证必须同样可达。
 pub fn chapter_number(name: &str) -> Option<i64> {
     let rest = name.strip_prefix('第')?;
-    let digits: String = rest
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    if digits.is_empty() {
+    let cs: Vec<char> = rest.trim_start().chars().collect();
+    let mut i = 0usize;
+    let mut num: i64 = 0;
+    while i < cs.len() && cs[i].is_ascii_digit() {
+        num = num
+            .saturating_mul(10)
+            .saturating_add(cs[i].to_digit(10)? as i64);
+        i += 1;
+    }
+    if i == 0 {
+        let (v, ni) = zh_number(&cs, 0)?;
+        num = v;
+        i = ni;
+    }
+    if num == 0 || num > 1_000_000 {
         return None;
     }
-    let tail = rest.trim_start().strip_prefix(&digits)?.trim_start();
+    let tail: String = cs[i..].iter().skip_while(|c| c.is_whitespace()).collect();
     if !tail.starts_with('章') {
         return None;
     }
-    digits.parse::<i64>().ok().filter(|n| *n > 0)
+    Some(num)
 }
 
 /// Called after a durable manuscript mutation, while the file lock is still held.
@@ -992,7 +1044,13 @@ mod tests {
     fn chapter_numbers_are_not_guessed_from_prose() {
         assert_eq!(chapter_number("第250章 雪夜.md"), Some(250));
         assert_eq!(chapter_number("第0章.md"), None);
+        // 文件名锚定：内嵌「第N章」的非章文件不当章号（设定组文件不触发记忆级联）
         assert_eq!(chapter_number("设定第2章说明.md"), None);
+        // F3：中文数字章名同等可达
+        assert_eq!(chapter_number("第十一章 雪夜.md"), Some(11));
+        assert_eq!(chapter_number("第一百二十三章.md"), Some(123));
+        assert_eq!(chapter_number("第二十章.md"), Some(20));
+        assert_eq!(chapter_number("第十章.md"), Some(10));
     }
     #[test]
     fn hidden_memory_is_not_automatically_exposed() {

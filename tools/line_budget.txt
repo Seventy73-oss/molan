@@ -10,7 +10,9 @@ crates/molan-core/src/files.rs	2078
 # currentState 三组逐字重复实现收敛为共享 helper；确认与校验逻辑按要求未删。本次修复净 +6 行（3196->3202）。
 crates/molan-server/src/glue.js	3210
 crates/molan-server/src/main.rs	585
-crates/molan-core/src/continuity.rs	1040
+# F3（M2 必做，FRONTEND-AGENT-INTEGRATION §8.6/P1）：chapter_number 统一中文数字章名
+# （第十一章.md 批准后记忆/依赖/凭证可达）+ 对应回归测试；解析器保持文件名锚定不猜散文。
+crates/molan-core/src/continuity.rs	1098
 crates/molan-llm/src/lib.rs	1210
 crates/molan-server/src/auth.rs	970
 crates/molan-server/src/handlers/stream/decompose.rs	1151

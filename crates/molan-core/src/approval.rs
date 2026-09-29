@@ -495,4 +495,53 @@ mod tests {
             Some("被人改过的正文")
         );
     }
+
+    /// F3：中文数字章名（第十一章.md）批准后，凭证/记忆/溯源同等可达——
+    /// 旧 chapter_number 只认阿拉伯数字，中文章名会让依赖检查与 origin 登记静默失效。
+    #[test]
+    fn chinese_numeral_chapter_approve_and_provenance_reachable() {
+        let (_d, db, book) = fixture();
+        let body = "第十一章 雪夜。内容足够长以通过各类长度校验。".repeat(6);
+        files::write_file(&db, &book, REVIEW_GROUP, "第十一章.md", &body).unwrap();
+        enqueue(&db, &book, 11, "第十一章.md");
+        // 溯源登记在批准前（草稿仍在待审组）；旧解析器在此即 Err「草稿来源无效」
+        crate::continuity::record_draft_origin(
+            &db,
+            &book,
+            11,
+            "第十一章.md",
+            &content_hash(&body),
+            "task-zh",
+        )
+        .unwrap();
+        let final_name = files::approve_pending_chapter(&db, &book, "第十一章.md").unwrap();
+        assert_eq!(final_name, "第十一章.md");
+        // 批准凭证可达（记忆同步/幂等重入依赖它）
+        let receipt = approved_hash(&db, &book, "第十一章.md").unwrap();
+        assert_eq!(receipt.as_deref(), Some(content_hash(&body).as_str()));
+        // 依赖可达：第12章依赖第11章正式稿 hash
+        files::write_file(&db, &book, REVIEW_GROUP, "第十二章.md", "第十二章 草稿").unwrap();
+        crate::continuity::record_draft_origin(
+            &db,
+            &book,
+            12,
+            "第十二章.md",
+            &content_hash("第十二章 草稿"),
+            "task-zh",
+        )
+        .unwrap();
+        crate::continuity::record_draft_dependency(
+            &db,
+            &book,
+            12,
+            11,
+            &content_hash(&body),
+            "task-zh",
+        )
+        .unwrap();
+        assert!(check_draft_dependency(&db, &book, 12).is_ok());
+        // 父稿被改 → 依赖失效（中文章名同样触发级联）
+        files::write_file(&db, &book, "正文", "第十一章.md", "第十一章 被改").unwrap();
+        assert!(check_draft_dependency(&db, &book, 12).is_err());
+    }
 }
