@@ -120,9 +120,16 @@ pub(crate) fn preview(
         }
         out.push(json!({"label": "最近正文结尾（衔接锚点）", "file": null}));
     }
-    if next["stage"].as_str() == Some("chapter_body") && ch > 0 {
+    let stage = next["stage"].as_str().unwrap_or("");
+    if (stage == "chapter_body" || stage == "outline_confirm") && ch > 0 {
         if let Some(n) = target_outline_name(db, book_id, ch) {
-            out.push(json!({"label": format!("本章细纲·第{}章", ch), "file": n}));
+            // 手动线：outline_confirm 阶段明示「待确认」的正是这份细纲
+            let label = if stage == "outline_confirm" {
+                format!("本章细纲（待你确认）·第{}章", ch)
+            } else {
+                format!("本章细纲·第{}章", ch)
+            };
+            out.push(json!({"label": label, "file": n}));
         }
     }
     json!(out)

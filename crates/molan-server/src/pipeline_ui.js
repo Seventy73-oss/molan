@@ -1,9 +1,11 @@
-// 生产线 UI 桥 —— WAVE2 简约重设计版。
+// 生产线 UI 桥 —— 手动线版（WAVE2 简约设计 + M2 手动线接线）。
 //
 // 职责（两件事，互不干扰）：
 //  1) 上游限流条：观察生成流的 error 事件，code=UPSTREAM_LIMIT 时弹「换模型重试」条。
 //     约束不变：只在用户显式点击后才写 agent_profile 设置，绝不静默改用户模型配置。
-//  2) 生产线面板：状态由 get_pipeline_state 文件即真相推导，动作走既有 store 显式通道。
+//  2) 生产线面板：状态由 get_pipeline_state 文件即真相推导；手动线动作走真实 IPC——
+//     确认细纲入库=confirm_outline、起草正文=draft_chapter（流式，与 Agent 工具同一服务）、
+//     记忆重跑=rebuild_memory；其余阶段仍走既有 store 显式通道。
 //
 // 设计语言（任务 A）：白底 / 1px 浅灰分隔线 #ececec / 无卡片堆叠阴影 / 圆角 8px /
 // 系统字体栈 / 13px 正文 12px 辅助 / 行高 1.6 / 留白 14-16px；单强调色琥珀 #d97706
@@ -16,6 +18,7 @@
 //  - st.blockers?.length            → 待处理提示行（缺失则不显示）
 //  - c.approvalVerified/bodySource  → 「未核验」标记（缺失则不加标记）
 //  - c.memory                       → 记忆维度（缺失则视为未同步）
+//  - c.outlineStatus                → 细纲确认维度（缺失则退回「有文件=绿」旧渲染）
 (() => {
   if (window.__WX_PIPELINE_UI__) return;
   window.__WX_PIPELINE_UI__ = true;
@@ -39,7 +42,7 @@
     pending: '#d97706',
     fail: '#dc2626',
     font: '-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif',
-    panelW: 300,
+    panelW: 360,
   };
 
   const ROLE_LABELS = { outline: '细纲', chapter: '正文', review: '审读', summary: '总结', distill: '蒸馏', chat: '聊天' };
@@ -224,8 +227,59 @@
     return ret;
   };
 
-  // ============ 动作桥（全部走既有 store 显式通道；不伪造写操作） ============
+  // ============ 动作桥（手动线动作走真实 IPC；其余走既有 store 显式通道，不伪造写操作） ============
   const currentBook = () => (typeof window.__molanCurrentBookId === 'function' ? window.__molanCurrentBookId() : '');
+
+  // Channel 构造（与 agent_ui 同协议）：原生 Channel 优先，退化 transformCallback shim。
+  // 官方 Channel 靠 toJSON/id 走 glue 序列化协议，绝不换成代理对象。
+  function makeChannel(handler) {
+    const onMsg = (raw) => {
+      const payload = (raw && typeof raw === 'object' && 'message' in raw) ? raw.message : raw;
+      try { handler(payload); } catch (e) {}
+    };
+    const Ctor = (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.Channel)
+      || (window.__TAURI__ && window.__TAURI__.Channel)
+      || (internals && internals.Channel)
+      || null;
+    if (typeof Ctor === 'function') {
+      try {
+        const ch = new Ctor(onMsg);
+        if (ch && ch.id != null && typeof ch.toJSON === 'function') return ch;
+      } catch (e) {}
+    }
+    if (typeof internals.transformCallback !== 'function') return null;
+    const id = internals.transformCallback(onMsg);
+    return { id: id, toJSON() { return '__CHANNEL__:' + id; } };
+  }
+
+  // 起草正文：draft_chapter 流式 IPC（与 Agent 工具 draft_chapter_body 同一后端服务）。
+  // 进度经事件通道如实展示；done 只说明草稿进待审，绝不显示「已定稿」。
+  let drafting = false;
+  async function draftBody(ch) {
+    const bookId = currentBook();
+    if (!bookId) { toast('未找到当前书'); return; }
+    if (drafting) { toast('已有起草在进行——等它完成或到创作助手停止'); return; }
+    const chan = makeChannel((ev) => {
+      if (!ev || typeof ev !== 'object') return;
+      if (ev.type === 'progress' && ev.chars > 0) toast('第' + ch + '章生成中… ' + ev.chars + ' 字');
+      else if (ev.type === 'step') toast('第' + ch + '章：' + (ev.title || ''));
+      else if (ev.type === 'done') toast('第' + ch + '章草稿已进「正文待审」，请审阅后定稿');
+      else if (ev.type === 'error') toast('第' + ch + '章起草失败：' + (ev.message || ''));
+    });
+    if (!chan) { toast('事件通道不可用，无法起草'); return; }
+    drafting = true;
+    const requestId = (window.crypto && typeof window.crypto.randomUUID === 'function')
+      ? window.crypto.randomUUID() : 'draft-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+    toast('第' + ch + '章开始起草（前置检查→生成→去味→落待审）…');
+    try {
+      await ipc('draft_chapter', { bookId: bookId, ch: ch, requestId: requestId, onEvent: chan });
+    } catch (e) {
+      toast('第' + ch + '章起草失败：' + (e && e.message ? e.message : String(e)));
+    } finally {
+      drafting = false;
+      scheduleRefresh(0);
+    }
+  }
 
   function act(kind, ch) {
     if (inflight > 0) { toast('当前有生成在进行——等它完成或先停止，再走下一步'); return; }
@@ -233,13 +287,24 @@
       if (kind === 'outline') window.__molanRunChat({ text: '帮我出这本书的全书大纲：核心立意、主线三幕、主要人物与对抗关系、卷结构与前3章钩子。先给我方向选择，确认后再细化。', displayText: '生成全书大纲', skills: ['剧情推演'], files: [], clearComposer: false });
       else if (kind === 'setup') window.__molanRunChat({ text: '根据现有大纲与设定，整理建书档案：书名定档、类型定位、主角与人物表、世界观、力量体系、伏笔台账。', displayText: '整理建书档案', skills: ['设定共建'], files: [], clearComposer: false });
       else if (kind === 'chapter_outline') { if (window.__molanNextOutline) window.__molanNextOutline(); else window.__molanRunChat({ text: '帮我生成第' + ch + '章细纲。若还需对齐走向，只问一个最关键问题。', displayText: '生成第' + ch + '章细纲', skills: ['小说细纲生成'], files: [], clearComposer: false }); }
-      else if (kind === 'chapter_body') { if (window.__molanNextBody) window.__molanNextBody(); else window.__molanRunChat({ text: '基于细纲写第' + ch + '章正文，章号必须是第' + ch + '章。', displayText: '写第' + ch + '章正文', skills: ['展开正文写作'], files: [], clearComposer: false }); }
+      // 手动线：确认入库=作者动作，直接走 confirm_outline IPC（绑定当前内容 hash，返回真实回执）
+      else if (kind === 'outline_confirm') {
+        ipc('confirm_outline', { bookId: currentBook(), ch: ch }).then((r) => {
+          toast('第' + ch + '章细纲已确认入库（' + String((r && r.hash) || '').slice(0, 8) + '…），可以起草正文');
+          scheduleRefresh(0);
+        }, (e) => { toast('确认失败：' + (e && e.message ? e.message : String(e))); });
+      }
+      // 手动线：起草正文=draft_chapter 流式 IPC（不再借道聊天文案桥）
+      else if (kind === 'chapter_body') draftBody(ch);
       else if (kind === 'review') { if (window.__wx_pend_reensure) window.__wx_pend_reensure(); toast('请在输入框上方的待审条里预览并接受第' + ch + '章'); }
       else if (kind === 'summary') window.__molanRunChat({ text: '请生成第' + ch + '章的承接摘要（供下一章细纲与正文衔接使用）：本章主要事件、人物关系变化、新埋设与已回收的伏笔、结尾钩子。300字以内，生成后我会保存到 参考/摘要_第' + ch + '章.md。', displayText: '生成第' + ch + '章摘要', skills: [], files: [], clearComposer: false });
       else if (kind === 'memory_fix') {
-        // 后端 F4 阻塞项。当前没有「重试记忆同步」的既有 store 通道，绝不伪造一键修复：
-        // 如实说明阻塞原因，让作者到该章自行处理。
-        toast('第' + ch + '章记忆未同步，已阻塞后续推进；请到该章重新同步记忆后再继续');
+        // 记忆重跑有真实 IPC（rebuild_memory：逐章、幂等、失败如实写 memory_job）：直接执行，不再只指路。
+        toast('正在重跑第' + ch + '章记忆同步…');
+        ipc('rebuild_memory', { bookId: currentBook(), ch: ch }).then((r) => {
+          toast('第' + ch + '章记忆重跑完成' + (r && r.note ? '：' + r.note : '') + '（失败原因可在记忆状态查看）');
+          scheduleRefresh(0);
+        }, (e) => { toast('记忆重跑失败：' + (e && e.message ? e.message : String(e))); });
       }
       // WAVE2：删除「按按钮文字找 DOM 并 click()」的批量桥（FRONTEND-AGENT-INTEGRATION §9 F4 要求）。
       // 批量链没有独立 IPC，凭文案点按钮既脆弱又不可验证；改为如实指路，不伪造成功。
@@ -287,7 +352,8 @@
     const type = b.type || b.kind || '';
     const status = b.status || '';
     let label = '';
-    if (type === 'memory') label = MEMORY_BLOCK_LABEL[status] || '记忆待处理';
+    if (type === 'outline') label = status === 'stale' ? '细纲确认后又被修改，需重新确认' : '细纲待确认入库';
+    else if (type === 'memory') label = MEMORY_BLOCK_LABEL[status] || '记忆待处理';
     else if (status === 'failed') label = '记忆同步失败';
     else if (status === 'stale') label = '记忆需复核';
     else if (status === 'pending') label = '记忆同步中';
@@ -300,11 +366,12 @@
     const s = nx && nx.stage;
     if (!s) return '';
     if (s === 'chapter_outline') return '生成第' + nx.chapter + '章细纲';
-    if (s === 'chapter_body') return '写第' + nx.chapter + '章正文';
+    // 手动线新增：细纲已存在但未确认/已失效 → 先确认入库再写正文
+    if (s === 'outline_confirm') return '确认第' + nx.chapter + '章细纲入库';
+    if (s === 'chapter_body') return '按已确认细纲起草第' + nx.chapter + '章正文';
     if (s === 'review') return '去审核第' + nx.chapter + '章';
-    // F4 后端新增：记忆未同步的已批准章阻塞后续推进。这里不假装能一键修记忆
-    // （没有对应的既有 store 通道），按钮只负责把作者带到第 N 章。
-    if (s === 'memory_fix') return '去处理第' + nx.chapter + '章记忆';
+    // F4 后端新增：记忆未同步的已批准章阻塞后续推进。rebuild_memory 有真实 IPC，直接重跑。
+    if (s === 'memory_fix') return '重跑第' + nx.chapter + '章记忆同步';
     return NEXT_LABELS[s] || '';
   }
 
@@ -363,7 +430,12 @@
         r.appendChild(el('span', 'wxpipe__unverified', '未核验'));
       }
       const mks = el('div', 'wxpipe__mks');
-      mks.appendChild(marker('纲', c && c.outline ? T.ok : T.todo, c && c.outline ? '细纲已保存' : '细纲未保存'));
+      // 细纲维度（手动线）：outlineStatus 存在时按确认状态渲染；字段缺失退回旧「有文件=绿」。
+      const os = c && c.outlineStatus;
+      const olColor = os === 'confirmed' ? T.ok : os === 'stale' ? T.fail : os === 'saved' ? T.pending : (c && c.outline ? T.ok : T.todo);
+      const olTitle = os === 'confirmed' ? '细纲已确认入库' : os === 'stale' ? '细纲确认后又被修改，原确认失效' : os === 'saved' ? '细纲已保存，待确认入库' : (c && c.outline ? '细纲已保存' : '细纲未保存');
+      if (os === 'stale') r.setAttribute('data-wxpipe-outline-stale', '1');
+      mks.appendChild(marker('纲', olColor, olTitle));
       mks.appendChild(marker('文', bodyColor(c && c.body), bodyLabel(c && c.body)));
       mks.appendChild(marker('忆', memColor(mem), memLabel(mem)));
       r.appendChild(mks);
@@ -550,7 +622,7 @@
 
   // 自检/联调导出（ui-check.cjs 用它做结构断言；不改变任何面板行为）
   window.__WX_PIPELINE_UI_API__ = {
-    version: 'wave2',
+    version: 'manual-v1',
     tokens: T,
     renderState: renderState,
     renderPanel: renderPanel,
@@ -560,6 +632,9 @@
     needsUnverified: needsUnverified,
     nextLabel: nextLabel,
     toast: toast,
+    act: act,
+    makeChannel: makeChannel,
+    __isDrafting: () => drafting,
     __panel: () => panelEl,
   };
 })();
