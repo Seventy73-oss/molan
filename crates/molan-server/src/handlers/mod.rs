@@ -641,6 +641,9 @@ pub async fn dispatch(
                     .and_then(|v| v.first()?.get("status")?.as_str().map(str::to_string));
                 out.push(json!({
                     "ch": ch, "name": name,
+                    // 手动线：status/contentHash 供前端对账与定稿绑定作者审阅过的版本
+                    "status": "pending",
+                    "contentHash": molan_core::continuity::content_hash(&content),
                     "words": content.chars().count(),
                     "preview": content.chars().take(160).collect::<String>(),
                     "outline": outline,
