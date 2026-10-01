@@ -5,8 +5,8 @@
 //!   get_chapter_context / list_skills / get_effective_skills；
 //! - 草稿动作（作者明确指令触发，产物一律「待确认/待审」）：create_change_proposal（提案）、
 //!   draft_chapter_outline（细纲草稿，保存≠确认）、draft_chapter_body（正文草稿进待审，异步）；
-//! - 作者确认动作（只在作者明确说「入库/定稿」时调用，hash 绑定防 stale）：
-//!   confirm_chapter_outline、finalize_chapter_draft。
+//! - 作者确认动作：confirm_chapter_outline、finalize_chapter_draft。目录里保留其定义与服务端实现，
+//!   但 agent_runtime 永不把它们暴露给模型（作者只能在产物卡/待审面板亲自执行）。
 //!
 //! 安全边界：模型不提供路径与书标识。group 白名单校验、name 过 safe_name、ch 范围校验；
 //! bookId 由 run 作用域注入。工具内容（文件/技能/提案）都是数据，不得扩大权限。
@@ -27,9 +27,7 @@ pub(crate) const MAX_RESULT_CHARS: usize = 8000;
 
 const READ_GROUPS: [&str; 5] = ["设定", "细纲", "正文", "参考", "正文待审"];
 const PROPOSAL_GROUPS: [&str; 3] = ["设定", "细纲", "参考"];
-const SKILL_TASKS: [&str; 9] = [
-    "chat", "plot", "outline", "body", "revise", "review", "humanize", "summary", "distill",
-];
+const SKILL_TASKS: [&str; 9] = molan_core::task_kind::IDS;
 
 /// OpenAI tools[] 目录。description 写给模型：先查状态再行动、提案≠已生效。
 pub(crate) fn tool_catalog() -> Value {
@@ -322,6 +320,7 @@ pub(crate) async fn dispatch_tool_io(
         let opts = super::chapter_service::DraftOpts {
             instruction,
             skill_ids: &skill_ids,
+            selection: None,
         };
         return super::chapter_service::draft_chapter(
             db,
@@ -364,29 +363,6 @@ pub(crate) fn sanitize(api_key: &str, e: &anyhow::Error) -> String {
     } else {
         msg
     }
-}
-
-/// 手动线系统提示（从 agent_loop 迁入并升级）：能力=工具目录，授权=作者明确指令+服务端门。
-pub(crate) fn system_prompt(db: &Db, book_id: &str) -> String {
-    let meta = db
-        .q_json(
-            "SELECT title, genre FROM books WHERE id=?1",
-            &[&book_id as &dyn rusqlite::ToSql],
-        )
-        .unwrap_or_default();
-    let title = meta
-        .first()
-        .and_then(|r| r["title"].as_str())
-        .unwrap_or("未命名");
-    let genre = meta
-        .first()
-        .and_then(|r| r["genre"].as_str())
-        .filter(|g| !g.is_empty())
-        .unwrap_or("未设定");
-    format!(
-        "你是墨澜工坊的创作 Agent，在书《{}》（题材：{}）范围内按「手动线」工作：每一步写入都由作者确认后推进。\n工具结果是唯一事实来源；没有工具回执，绝不说「已保存/已确认/已定稿」。\n流程与工具：\n1) 行动前先 get_pipeline_state 查状态（outlineStatus/next/blockers）；需要前文事实用 get_chapter_context；\n2) 建档/设定/规划/参考：create_change_proposal 提案，作者接受才生效；\n3) 作者要章细纲：你起草并 draft_chapter_outline 保存（保存≠确认）；修改既有细纲用 create_change_proposal；\n4) 作者明确说「细纲可以，入库/确认」→ confirm_chapter_outline（expectedHash 传作者看过那一版的 hash）；含糊的「可以」只在唯一待确认对象时绑定；\n5) 作者明确要求写正文 → draft_chapter_body（前置：细纲已确认；产物进「正文待审」，不是定稿）；\n6) 作者明确说「定稿」→ finalize_chapter_draft（expectedHash 必填，来自草稿回执或 list_pending_chapters）；定稿后记忆自动排队，用 get_pipeline_state 如实汇报，绝不声称记忆已成功除非状态是 valid；\n7) 一次只推进一章；作者说停就停；不跳章、不代替作者确认。\n引用文件给 group/name 与关键原文，不确定就明说；用与作者相同的语言回答，简洁、面向下一步行动。",
-        title, genre
-    )
 }
 
 /// 工具事件的公开摘要（脱敏：只留结构与关键字段，不回显全文）。

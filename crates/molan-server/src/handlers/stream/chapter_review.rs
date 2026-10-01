@@ -267,27 +267,39 @@ impl ReviewOutcome {
     }
 }
 
+/// 审稿系统提示：固定 JSON 协议 + 项目审稿角色 + 「审稿」子阶段技能（run_plan::stage_plan 冻结）。
+/// 技能只能调整审查重点，不能改变输出协议（正文写作卡因任务不适用不会出现在这里）。
+pub(crate) fn review_system(db: &molan_core::db::Db, book_id: &str, plan: &Value) -> String {
+    let mut sys =
+        "你是网文责编，审读一章正文。只输出一个 JSON 对象，不要解释、不要代码块标记。".to_string();
+    if let Ok(extra) = molan_core::deepwrite::strict_agent_instructions(db, book_id, "continuity") {
+        if !extra.is_empty() {
+            sys.push_str("\n\n");
+            sys.push_str(&extra);
+        }
+    }
+    let skills = super::run_plan::stage_skills_text(plan, &sys);
+    if !skills.is_empty() {
+        sys.push_str("\n\n");
+        sys.push_str(&skills);
+        sys.push_str("\n【协议硬约束】以上技能只能调整审查重点，不能改变输出协议；最终回答仍必须是本阶段要求的 JSON 对象。");
+    }
+    sys
+}
+
 /// 可复用审核调用主体：LLM 调用 + 严格 JSON 解析 + fail-closed 语义。
 /// 返回 verdict JSON {ok,issues,fix} + 报告；flagged=true 表示必须转人工待审。
 /// cancel 由调用方传入（批量走 auto_cancel_token，单章走本轮 turn 的取消令牌）。
-pub(crate) async fn review_body(
+async fn review_body_once(
     db: &molan_core::db::Db,
     book_id: &str,
     ch: i64,
     pending_block: &str,
     body: &str,
     cancel: Option<CancellationToken>,
+    plan: &Value,
 ) -> ReviewOutcome {
-    let mut sys =
-        "你是网文责编，审读一章正文。只输出一个 JSON 对象，不要解释、不要代码块标记。".to_string();
-    if let Ok(project_agent) =
-        molan_core::deepwrite::strict_agent_instructions(db, book_id, "continuity")
-    {
-        if !project_agent.is_empty() {
-            sys.push_str("\n\n");
-            sys.push_str(&project_agent);
-        }
-    }
+    let sys = review_system(db, book_id, plan);
     let (user, body_truncated) = build_review_user(db, book_id, ch, pending_block, body);
     if body_truncated {
         // 超单次预算：未覆盖全文，绝不自动放行（可人工审或后续分块实现）
@@ -408,6 +420,7 @@ pub(crate) async fn review_pending_saved(
     want_ch: Option<i64>,
     saved_files: &[String],
     cancel: Option<CancellationToken>,
+    plan: &Value,
 ) -> Option<(Value, Value)> {
     let prefix = format!("{} / ", molan_core::db::REVIEW_GROUP);
     let fname = saved_files.iter().find_map(|s| s.strip_prefix(&prefix))?;
@@ -419,7 +432,7 @@ pub(crate) async fn review_pending_saved(
         .or_else(|| crate::handlers::chapter_num_from_name(fname))
         .unwrap_or(0);
     let body_hash = molan_core::continuity::content_hash(&body);
-    let outcome = review_body(db, book_id, ch, "", &body, cancel).await;
+    let outcome = review_body(db, book_id, ch, "", &body, cancel, plan).await;
     let ok = !outcome.flagged && outcome.ok && outcome.issues.is_empty();
     let issues: Vec<Value> = outcome.issues.iter().cloned().map(Value::String).collect();
     let summary = json!({
@@ -430,6 +443,7 @@ pub(crate) async fn review_pending_saved(
         "flagged": outcome.flagged,
         // 原始 verdict 的 fix 指令（ok=false 时为重写总意见），供前端展示修改建议
         "fix": outcome.verdict["fix"],
+        "planHash": plan["planHash"],
     });
     let mut ev = json!({"type": "review", "ok": ok, "issues": issues, "bodyHash": body_hash});
     if !ok {
@@ -441,13 +455,14 @@ pub(crate) async fn review_pending_saved(
 /// 对「已被重写改变过的最终文本」重新执行同一套审核；返回 Err(原因) 表示不得定稿。
 /// 与初次审核共用 build_review_user / parse_review_verdict，但只调用一次（不重问），
 /// log_tag 记为 auto_review_final 以便用量区分。
-pub(crate) async fn recheck_reviewed_text(
+async fn recheck_once(
     db: &molan_core::db::Db,
     book_id: &str,
     ch: i64,
     pending_block: &str,
     text: &str,
     cancel: Option<CancellationToken>,
+    plan: &Value,
 ) -> Result<(), String> {
     // 复核同样受单次预算约束：重写后正文若超预算，绝不能只审前段就当通过
     let (review_user, truncated) = build_review_user(db, book_id, ch, pending_block, text);
@@ -461,14 +476,7 @@ pub(crate) async fn recheck_reviewed_text(
     let Some(chn) = molan_llm::resolve_agent_channel(db, "review") else {
         return Err("复核阶段无可用审核渠道".to_string());
     };
-    let mut review_sys =
-        "你是网文责编，审读一章正文。只输出一个 JSON 对象，不要解释、不要代码块标记。".to_string();
-    if let Ok(extra) = molan_core::deepwrite::strict_agent_instructions(db, book_id, "continuity") {
-        if !extra.is_empty() {
-            review_sys.push_str("\n\n");
-            review_sys.push_str(&extra);
-        }
-    }
+    let review_sys = review_system(db, book_id, plan);
     let params = ChatParams {
         base_url: chn["baseUrl"].as_str().unwrap_or("").to_string(),
         api_key: chn["key"].as_str().unwrap_or("").to_string(),
@@ -509,289 +517,58 @@ pub(crate) async fn recheck_reviewed_text(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::super::auto_write::resolve_humanize;
-    use super::*;
-    use molan_core::db::Db;
+/// 审稿（见 review_body_once），并把结论按被审文本的 hash 记入审稿账本：
+/// 之后文本若被修改 / 去味 / 重写，该结论在待审区显示为「已失效」。
+pub(crate) async fn review_body(
+    db: &molan_core::db::Db,
+    book_id: &str,
+    ch: i64,
+    pending_block: &str,
+    body: &str,
+    cancel: Option<CancellationToken>,
+    plan: &Value,
+) -> ReviewOutcome {
+    let out = review_body_once(db, book_id, ch, pending_block, body, cancel, plan).await;
+    let passed = !out.flagged && out.ok && out.issues.is_empty();
+    let verdict =
+        json!({"ok": passed, "flagged": out.flagged, "issues": out.issues, "note": out.note});
+    log_review(db, book_id, ch, body, &verdict, plan, "review");
+    out
+}
 
-    fn v(s: &str) -> Value {
-        serde_json::from_str(s).unwrap()
-    }
+/// 重写 / 去味后的复核（见 recheck_once），结论同样记入审稿账本。
+pub(crate) async fn recheck_reviewed_text(
+    db: &molan_core::db::Db,
+    book_id: &str,
+    ch: i64,
+    pending_block: &str,
+    text: &str,
+    cancel: Option<CancellationToken>,
+    plan: &Value,
+) -> Result<(), String> {
+    let r = recheck_once(db, book_id, ch, pending_block, text, cancel, plan).await;
+    let note = r.as_ref().err().cloned().unwrap_or_default();
+    let verdict = json!({"ok": r.is_ok(), "flagged": r.is_err(), "issues": [], "note": note});
+    log_review(db, book_id, ch, text, &verdict, plan, "recheck");
+    r
+}
 
-    fn set(db: &Db, key: &str, val: &str) {
-        db.exec(
-            "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            &[&key as &dyn rusqlite::ToSql, &val as &dyn rusqlite::ToSql],
-        )
-        .unwrap();
-    }
-
-    /// mock 渠道（channels=true）或无渠道的一本书测试库。
-    fn fixture(channels: bool) -> (tempfile::TempDir, Db, String) {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(dir.path(), None).unwrap();
-        if channels {
-            set(
-                &db,
-                "channels",
-                r#"[{"id":"mock","label":"Mock","baseUrl":"mock://","model":"mock-model"}]"#,
-            );
-            set(&db, "active_channel", "mock");
-        }
-        let book = molan_core::books::create_book(&db, "review-test", "玄幻", "第三人称")["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        (dir, db, book)
-    }
-
-    fn is_untrusted(j: &str) -> bool {
-        matches!(classify_verdict(&v(j)), ReviewDecision::Untrusted(_))
-    }
-
-    /// T4b 验收①：humanizeOverride 三态统一（表驱动）。
-    /// "" → 书级回落（缺失再 official:standard）；"none" → 明确关闭且压过书级；official/skill 显式。
-    #[test]
-    fn humanize_override_three_states_are_unified() {
-        let (_d, db, book) = fixture(true);
-        for (id, name, tpl, bk) in [
-            ("s-std", "标准", "STD", "method.humanize.standard"),
-            ("s-deep", "深度", "DEEP", "method.humanize.deep"),
-            ("my-style", "我的", "SKILL", ""),
-        ] {
-            db.exec(
-                "INSERT INTO skills(id,name,prompt_template,kind,enabled,builtin_key) VALUES(?1,?2,?3,'humanize',1,?4)",
-                &[&id as &dyn rusqlite::ToSql, &name, &tpl, &bk],
-            )
-            .unwrap();
-        }
-        let key = format!("book_humanize__{}", book);
-        // (override, 书级设置, 期望方法, 期望取到提示词)
-        let cases: &[(Option<&str>, &str, &str, bool)] = &[
-            (None, "official:deep", "official:deep", true),
-            (Some(""), "official:deep", "official:deep", true),
-            (Some("   "), "official:deep", "official:deep", true),
-            // "none" = 明确关闭，压过书级默认
-            (Some("none"), "official:deep", "none", false),
-            (None, "none", "none", false),
-            // official:* / skill:<id> 显式，压过书级
-            (
-                Some("official:standard"),
-                "official:deep",
-                "official:standard",
-                true,
-            ),
-            (
-                Some("skill:my-style"),
-                "official:deep",
-                "skill:my-style",
-                true,
-            ),
-            // 书级缺失 / 字面 "null" → 再缺省 official:standard
-            (None, "", "official:standard", true),
-            (None, "null", "official:standard", true),
-        ];
-        for (ov, book_set, want_method, want_prompt) in cases {
-            db.exec(
-                "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                &[&key as &dyn rusqlite::ToSql, &book_set as &dyn rusqlite::ToSql],
-            )
-            .unwrap();
-            let (method, prompt) = resolve_humanize(&db, &book, *ov);
-            assert_eq!(
-                method, *want_method,
-                "override={:?} book={:?}",
-                ov, book_set
-            );
-            assert_eq!(
-                !prompt.is_empty(),
-                *want_prompt,
-                "override={:?} book={:?}",
-                ov,
-                book_set
-            );
-        }
-        // 具体提示词内容也须取对（防 builtin_key 映射漂移）
-        db.exec(
-            "DELETE FROM settings WHERE key=?1",
-            &[&key as &dyn rusqlite::ToSql],
-        )
-        .unwrap();
-        assert_eq!(resolve_humanize(&db, &book, None).1, "STD");
-        assert_eq!(
-            resolve_humanize(&db, &book, Some("official:deep")).1,
-            "DEEP"
-        );
-        assert_eq!(
-            resolve_humanize(&db, &book, Some("skill:my-style")).1,
-            "SKILL"
-        );
-    }
-
-    /// T4b 验收②-a：review_body 通过分支（mock:// 的确定性审核 JSON）。
-    #[tokio::test]
-    async fn review_body_passes_on_mock_channel() {
-        let (_d, db, book) = fixture(true);
-        let body = format!("# 第1章 测试\n\n{}", "少年推开山门。".repeat(60));
-        let out = review_body(&db, &book, 1, "", &body, None).await;
-        assert!(!out.flagged, "mock 审核应可信：{}", out.note);
-        assert!(out.ok && out.issues.is_empty(), "{}", out.note);
-        assert!(out.note.starts_with("通过"));
-    }
-
-    /// T4b 验收②-b：渠道缺失 → fail-closed（不得冒充通过）。
-    #[tokio::test]
-    async fn review_body_fails_closed_without_review_channel() {
-        let (_d, db, book) = fixture(false);
-        let out = review_body(&db, &book, 1, "", "# 第1章 测试\n\n正文内容。", None).await;
-        assert!(out.flagged && !out.ok, "{}", out.note);
-        assert!(out.note.contains("无可用审核渠道"), "{}", out.note);
-    }
-
-    /// T4b 验收②-c：超单次预算（未覆盖全文）→ fail-closed，绝不「只审前段」放行。
-    #[tokio::test]
-    async fn review_body_fails_closed_over_budget() {
-        let (_d, db, book) = fixture(true);
-        let body = "字".repeat(REVIEW_BODY_BUDGET + 1);
-        let out = review_body(&db, &book, 1, "", &body, None).await;
-        assert!(out.flagged && !out.ok, "{}", out.note);
-        assert!(out.note.contains("超过单次审核预算"), "{}", out.note);
-        assert_eq!(REVIEW_BODY_BUDGET, 9000);
-    }
-
-    /// T4b 验收②-d：不通过 / 解析失败 / 结构不完整（mock 固定通过，故在纯判定层覆盖，
-    /// 与 auto_write 既有 parse_review_verdict 测试同层）。
-    #[test]
-    fn verdict_classification_is_fail_closed() {
-        assert!(matches!(
-            classify_verdict(&v(r#"{"ok":true,"issues":[]}"#)),
-            ReviewDecision::Pass { .. }
-        ));
-        match classify_verdict(&v(r#"{"ok":false,"issues":["人物死亡冲突"],"fix":"改掉"}"#))
-        {
-            ReviewDecision::Fix { ok, hard, fix, .. } => {
-                assert!(!ok);
-                assert_eq!(hard, vec!["人物死亡冲突".to_string()]);
-                assert_eq!(fix, "改掉");
-            }
-            _ => panic!("ok=false + issues 应判为需重写"),
-        }
-        assert!(is_untrusted(r#"{"ok":false,"issues":[]}"#));
-        assert!(is_untrusted("{}"));
-        assert!(is_untrusted(r#"{"ok":"true","issues":[]}"#));
-        assert!(is_untrusted(r#"{"ok":true,"issues":""}"#));
-        assert!(is_untrusted(r#"{"ok":true,"issues":[1]}"#));
-        assert!(extract_json_loose("模型跑题，没有任何 JSON").is_none());
-        match classify_verdict(&v(r#"{"ok":true,"issues":[],"warnings":["节奏略慢"]}"#)) {
-            ReviewDecision::Pass { note } => assert!(note.contains("软建议"), "{}", note),
-            _ => panic!("软建议不应阻断通过"),
-        }
-    }
-
-    fn test_state(dir: &tempfile::TempDir, db: Db) -> std::sync::Arc<crate::AppState> {
-        std::sync::Arc::new(crate::AppState {
-            db,
-            web_dir: dir.path().join("web"),
-            web_dir_canon: dir.path().join("web"),
-            root: dir.path().to_path_buf(),
-            auth_token: None,
-            sessions: crate::auth::SessionStore::with_defaults(),
-            login_limiter: crate::auth::LoginLimiter::with_defaults(),
-            trusted_scheme: "http".to_string(),
-            secure_cookies: false,
-        })
-    }
-
-    async fn collect_chat(
-        st: &std::sync::Arc<crate::AppState>,
-        args: &Value,
-    ) -> (anyhow::Result<Option<Value>>, Vec<Value>) {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
-        let a = args.clone();
-        let runner = {
-            let st = st.clone();
-            async move {
-                let r = super::super::chat::chat_stream(&st, "chat_stream", &a, &tx).await;
-                drop(tx);
-                r
-            }
-        };
-        let collector = async {
-            let mut events = Vec::new();
-            while let Some(line) = rx.recv().await {
-                if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
-                    events.push(v["e"].clone());
-                }
-            }
-            events
-        };
-        tokio::join!(runner, collector)
-    }
-
-    /// T4b 验收③：explicit-task 正文（≥300 字）落盘成功后必须发 review 事件，
-    /// bodyHash 必须绑定「落盘内容」而不是别的文本。
-    #[tokio::test]
-    async fn explicit_body_save_emits_review_event() {
-        let (dir, db, book) = fixture(true);
-        set(&db, &format!("book_auto_save__{}", book), "auto");
-        let sid = molan_core::books::create_session(&db, &book, "审读会话").unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let st = test_state(&dir, db);
-        let a = json!({
-            "onEvent": "__CHANNEL__:1", "sessionId": sid, "bookId": book,
-            "message": "写第1章正文", "task": "body",
-            "writeIntent": "explicit-task", "requestId": "req-review-1",
-        });
-        let (res, events) = collect_chat(&st, &a).await;
-        res.unwrap().unwrap();
-        assert!(
-            events.iter().any(|e| e["type"] == "saved"),
-            "explicit-task 正文应落盘：{:?}",
-            events
-        );
-        let reviews: Vec<&Value> = events.iter().filter(|e| e["type"] == "review").collect();
-        assert_eq!(reviews.len(), 1, "应恰好一条 review 事件：{:?}", events);
-        assert_eq!(reviews[0]["ok"], json!(true), "{:?}", reviews[0]);
-        assert_eq!(reviews[0]["issues"], json!([]));
-        let hash = reviews[0]["bodyHash"].as_str().unwrap_or("");
-        assert_eq!(hash.len(), 64, "bodyHash 应为 SHA-256：{}", hash);
-        let landed =
-            molan_core::files::read_file(&st.db, &book, molan_core::db::REVIEW_GROUP, "第1章.md")
-                .expect("待审稿应已落盘");
-        assert_eq!(hash, molan_core::continuity::content_hash(&landed));
-    }
-
-    /// T4b 验收③：preview 不审核（无 saved、无 review 事件）。
-    #[tokio::test]
-    async fn preview_body_is_not_reviewed() {
-        let (dir, db, book) = fixture(true);
-        set(&db, &format!("book_auto_save__{}", book), "auto");
-        let sid = molan_core::books::create_session(&db, &book, "预览会话").unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let st = test_state(&dir, db);
-        let a = json!({
-            "onEvent": "__CHANNEL__:1", "sessionId": sid, "bookId": book,
-            "message": "写第1章正文", "task": "body",
-            "writeIntent": "preview", "requestId": "req-preview-1",
-        });
-        let (_res, events) = collect_chat(&st, &a).await;
-        assert!(
-            !events.iter().any(|e| e["type"] == "review"),
-            "preview 不得发 review 事件：{:?}",
-            events
-        );
-        assert!(!events.iter().any(|e| e["type"] == "saved"));
-        assert!(molan_core::files::read_file(
-            &st.db,
-            &book,
-            molan_core::db::REVIEW_GROUP,
-            "第1章.md"
-        )
-        .is_none());
+fn log_review(
+    db: &molan_core::db::Db,
+    book: &str,
+    ch: i64,
+    text: &str,
+    v: &Value,
+    plan: &Value,
+    src: &str,
+) {
+    let hash = molan_core::continuity::content_hash(text);
+    let plan_hash = plan["planHash"].as_str().unwrap_or("");
+    if let Err(e) = molan_core::review_log::record(db, book, ch, &hash, v, plan_hash, src) {
+        tracing::warn!("审稿结论记账失败（不影响审稿结果）：{}", e);
     }
 }
+
+#[cfg(test)]
+#[path = "chapter_review_tests.rs"]
+mod tests;

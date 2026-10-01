@@ -832,12 +832,12 @@ pub fn input_fingerprint(db: &Db, book: &str, target_ch: i64) -> Result<String> 
         "SELECT kind,payload_json,revision FROM story_plan WHERE book_id=?1 ORDER BY kind",
         &[&book],
     )?;
-    let skills = db.q_json(
-        "SELECT id,prompt_template,enabled,usage_mode,targets_json FROM skills ORDER BY id",
-        &[],
-    )?;
+    // 技能不计入：生成使用冻结的技能计划快照（skill_resolver::freeze），编辑无关技能
+    // 不应让在飞章节被拒；作品级技能绑定仍在 settings 中参与比较。
     let metadata = db.q_json("SELECT genre,pov FROM books WHERE id=?1", &[&book])?;
-    Ok(content_hash(&json!({"files":entries,"settings":settings,"plans":plans,"skills":skills,"metadata":metadata}).to_string()))
+    Ok(content_hash(
+        &json!({"files":entries,"settings":settings,"plans":plans,"metadata":metadata}).to_string(),
+    ))
 }
 
 #[cfg(test)]

@@ -89,6 +89,18 @@ async fn draft_lands_in_review_with_bound_receipt() {
     // 审核报告绑定落盘 hash（mock 审核通过）
     assert_eq!(r["review"]["bodyHash"].as_str().unwrap(), hash);
     assert_eq!(r["review"]["ok"], json!(true));
+    // 审稿账本：结论对应当前待审稿、可追溯到审稿子阶段计划；正文被改后变为「已失效」
+    let rv = molan_core::review_log::latest(&db, &book, 1, &hash);
+    assert_eq!(
+        (rv["state"].as_str(), rv["ok"].as_bool()),
+        (Some("current"), Some(true))
+    );
+    assert_eq!(rv["planHash"], r["stagePlans"]["review"]);
+    let edited = continuity::content_hash(&format!("{}\n作者补写一句。", landed));
+    assert_eq!(
+        molan_core::review_log::latest(&db, &book, 1, &edited)["state"],
+        "stale"
+    );
     // 上下文清单含技能快照列（§6/§8.4 可追责）
     let man = db
         .q_json(
@@ -186,7 +198,8 @@ async fn draft_preflight_rejects_unconfirmed_or_existing() {
     assert!(files::read_file(&db, &book, molan_core::db::REVIEW_GROUP, "第1章.md").is_none());
 }
 
-/// 定稿绑定 hash + 幂等重入 + sweep 对「已定稿但记忆 pending」的章补发抽取（mock 下如实失败）。
+/// 定稿绑定 hash + 幂等重入 + sweep 对「已定稿但记忆 pending」的章补发抽取。
+/// mock 记录员引用正文原句作证据，经真实校验器通过后才会落为 done（校验失败路径见 continuity 测试）。
 #[tokio::test]
 async fn finalize_binds_hash_and_sweep_syncs_memory() {
     let (dir, db, book) = fixture();
@@ -222,5 +235,14 @@ async fn finalize_binds_hash_and_sweep_syncs_memory() {
             break;
         }
     }
-    assert_eq!(last, "failed", "mock 下记忆抽取必须如实失败，绝不静默成功");
+    assert_eq!(last, "done", "sweep 必须补发抽取并走到终态");
+    let ev = st
+        .db
+        .q_json(
+            "SELECT source_hash FROM chapter_memory WHERE book_id=?1 AND ch=1 AND status='valid'",
+            &[&book as &dyn rusqlite::ToSql],
+        )
+        .unwrap();
+    assert_eq!(ev.len(), 1, "抽取结果必须落库");
+    assert_eq!(ev[0]["sourceHash"], json!(hash), "记忆绑定定稿正文 hash");
 }

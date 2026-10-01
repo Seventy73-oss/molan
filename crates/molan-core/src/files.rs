@@ -341,7 +341,10 @@ fn atomic_write_inner(fp: &Path, content: &str, noclobber: bool) -> Result<()> {
             Ok(()) => return Ok(()),
             // noclobber 冲突是确定性冲突，不重试
             Err(e) if noclobber && e.to_string().contains("目标已存在") => return Err(e),
-            Err(e) => last = Some(e),
+            Err(e) => {
+                eprintln!("[molan-core] 写入重试（{}）：{}", fp.display(), e);
+                last = Some(e)
+            }
         }
     }
     Err(last.unwrap_or_else(|| anyhow!("写入失败：{}", fp.display())))
@@ -373,6 +376,23 @@ pub(crate) fn write_file_locked(
     name: &str,
     content: &str,
 ) -> Result<()> {
+    strict(write_file_locked_outcome(db, book_id, group, name, content))
+}
+
+/// 旧调用方语义：「文件已写入但索引失败」折叠为 Err（文件不回滚）。
+fn strict(r: Result<Option<String>>) -> Result<()> {
+    r.and_then(|i| i.map_or(Ok(()), |e| Err(anyhow!(e))))
+}
+
+/// 同 `write_file_locked`，但把「文件已落盘、派生索引失败」作为 `Ok(Some(原因))` 返回，
+/// 供 DocumentWriteService 报告**部分成功**（`Err` 只表示文件没有写入）。
+pub(crate) fn write_file_locked_outcome(
+    db: &Db,
+    book_id: &str,
+    group: &str,
+    name: &str,
+    content: &str,
+) -> Result<Option<String>> {
     let canon = normalize_group(group);
     if canon == "_invalid_" {
         bail!("非法分组名：{:?}", group);
@@ -388,7 +408,7 @@ pub(crate) fn write_file_locked(
     };
     if let Some(o) = &old {
         if o == content {
-            return Ok(());
+            return Ok(None);
         }
     }
     // 版本快照失败必须中止：否则会用新内容覆盖掉唯一可回滚的旧稿
@@ -399,18 +419,33 @@ pub(crate) fn write_file_locked(
     atomic_write(&fp, content)?;
     // 文件已落盘；此后任何派生索引失败都不得回滚/删除刚保存的稿件
     crate::stats::refresh_words(db, book_id);
-    crate::continuity::note_file_change(db, book_id, &canon, name, old.as_deref(), Some(content))
-        .map_err(|e| index_error(&canon, name, e))?;
+    let index = crate::continuity::note_file_change(
+        db,
+        book_id,
+        &canon,
+        name,
+        old.as_deref(),
+        Some(content),
+    )
+    .err()
+    .map(|e| index_error(&canon, name, e).to_string());
     eprintln!(
         "[molan-core] 写入OK: {} ({}字)",
         fp.display(),
         content.chars().count()
     );
-    Ok(())
+    Ok(index)
 }
 
 /// 锁内“仅新建”写：目标已存在即冲突；persist_noclobber 防外部并发 TOCTOU。
-fn write_new_locked(db: &Db, book_id: &str, group: &str, name: &str, content: &str) -> Result<()> {
+/// 派生索引失败以 `Ok(Some(原因))` 返回（部分成功），语义同 `write_file_locked_outcome`。
+pub(crate) fn write_new_locked_outcome(
+    db: &Db,
+    book_id: &str,
+    group: &str,
+    name: &str,
+    content: &str,
+) -> Result<Option<String>> {
     let canon = normalize_group(group);
     if canon == "_invalid_" {
         bail!("非法分组名：{:?}", group);
@@ -422,9 +457,33 @@ fn write_new_locked(db: &Db, book_id: &str, group: &str, name: &str, content: &s
     }
     atomic_write_new(&fp, content)?;
     crate::stats::refresh_words(db, book_id);
-    crate::continuity::note_file_change(db, book_id, &canon, name, None, Some(content))
-        .map_err(|e| index_error(&canon, name, e))?;
-    Ok(())
+    Ok(
+        crate::continuity::note_file_change(db, book_id, &canon, name, None, Some(content))
+            .err()
+            .map(|e| index_error(&canon, name, e).to_string()),
+    )
+}
+
+/// 带校验的读取：书必须有效、路径必须在书库内；不存在返回 `Ok(None)`（与空文件区分），
+/// 其他 IO 错误如实返回，绝不当成空内容。
+pub(crate) fn read_checked(
+    db: &Db,
+    book_id: &str,
+    group: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    book_dir(db, book_id)?;
+    let fp = book_base_checked(db, book_id, group, name)?;
+    match std::fs::read_to_string(&fp) {
+        Ok(c) => Ok(Some(c)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow!(
+            "读取失败（{}/{}）：{}",
+            normalize_group(group),
+            name,
+            e
+        )),
+    }
 }
 
 /// 人工写入：可修改 locked 文件（locked 只阻止 AI），但必须原子保存。失败返回 Err。
@@ -442,7 +501,7 @@ pub fn write_file_new(
     content: &str,
 ) -> Result<()> {
     let _g = db.fs_lock.lock().unwrap_or_else(|e| e.into_inner());
-    write_new_locked(db, book_id, group, name, content)
+    strict(write_new_locked_outcome(db, book_id, group, name, content))
 }
 
 /// AI 写入（带锁内前置校验回调）。
@@ -465,6 +524,18 @@ where
     let _g = db.fs_lock.lock().unwrap_or_else(|e| e.into_inner());
     // 锁内前置校验：任何失败都必须阻止写入
     check()?;
+    strict(write_ai_new_locked(db, book_id, group, name, content))
+}
+
+/// AI 新建写入的锁内版本（调用方持有 fs_lock）：锁定拒绝、目标存在拒绝、
+/// 正文/正文待审交叉同名拒绝；派生索引失败以 `Ok(Some(原因))` 返回（文件已保存）。
+pub(crate) fn write_ai_new_locked(
+    db: &Db,
+    book_id: &str,
+    group: &str,
+    name: &str,
+    content: &str,
+) -> Result<Option<String>> {
     let canon = normalize_group(group);
     if canon == "_invalid_" {
         bail!("非法分组名：{:?}", group);
@@ -491,7 +562,7 @@ where
             );
         }
     }
-    write_new_locked(db, book_id, &canon, name, content)
+    write_new_locked_outcome(db, book_id, &canon, name, content)
 }
 
 /// AI 写入：锁定文件拒绝；只允许不存在目标；
@@ -630,24 +701,21 @@ pub(crate) fn delete_file_locked(
     Ok(tid)
 }
 
-// ---------- 版本 ----------
+// ---------- 版本（原子写 + 不覆盖：同毫秒的第二份快照顺延 ts，绝不覆盖已有快照） ----------
 
 pub fn save_version(db: &Db, book_id: &str, group: &str, name: &str, content: &str) -> Result<()> {
-    let ts = crate::stats::now_ms();
-    let dir = db
-        .versions_dir
-        .join(safe_name(book_id))
-        .join(normalize_group(group))
-        .join(safe_name(name));
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("创建版本目录失败：{}", dir.display()))?;
-    let fp = dir.join(format!("{}.json", ts));
-    std::fs::write(
-        &fp,
-        json!({"ts": ts, "content": content, "note": ""}).to_string(),
-    )
-    .with_context(|| format!("写入版本快照失败：{}", fp.display()))?;
-    Ok(())
+    let dir = version_dir(db, book_id, group, name);
+    let mut ts = crate::stats::now_ms();
+    for _ in 0..64 {
+        let fp = dir.join(format!("{}.json", ts));
+        if !fp.exists() {
+            let body = json!({"ts": ts, "content": content, "note": ""}).to_string();
+            return atomic_write_new(&fp, &body)
+                .with_context(|| format!("写入版本快照失败：{}", fp.display()));
+        }
+        ts += 1;
+    }
+    bail!("版本快照编号冲突过多：{}", dir.display())
 }
 
 fn version_dir(db: &Db, book_id: &str, group: &str, name: &str) -> PathBuf {
@@ -1005,38 +1073,8 @@ pub fn delete_folder(db: &Db, book_id: &str, name: &str) -> Result<String> {
     Ok(canon)
 }
 
-pub fn import_book(db: &Db, title: &str, genre: &str, files: &[Value]) -> Result<Value> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = crate::stats::now_ms();
-    db.exec(
-        "INSERT INTO books(id,title,genre,pov,status,cover_char,word_count,chapter_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        &[
-            &id,
-            &title,
-            &genre,
-            &"第三人称",
-            &"构思中",
-            &(title.chars().next().map(|c| c.to_string()).unwrap_or_else(|| "书".into())),
-            &0i64,
-            &0i64,
-            &now,
-            &now,
-        ],
-    )?;
-    ensure_book_dir(db, &id)?;
-    for f in files {
-        let name = f["name"].as_str().unwrap_or("章节.md");
-        let content = f["content"].as_str().unwrap_or("");
-        write_file(db, &id, "正文", name, content)?;
-        // 导入章标注来源：未经系统批准的章节不得被状态机当作 AI 定稿链推进（C3）
-        if let Some(ch) = crate::continuity::chapter_number(name) {
-            if let Err(e) = crate::chapter_state::record_origin(db, &id, ch, "import") {
-                eprintln!("[molan-core] 导入章 origin 记账失败（不阻断导入）：{}", e);
-            }
-        }
-    }
-    Ok(json!({"bookId": id}))
-}
+/// 导入整本书：实现见 book_import（失败时把半成品移入作品回收站）。
+pub use crate::book_import::import_book;
 
 // ---------- 文件级标志（locked / aiOff） ----------
 

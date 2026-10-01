@@ -1,0 +1,76 @@
+{
+  "contract": 2,
+  "tasks": [
+    {
+      "artifactKind": null,
+      "id": "chat",
+      "label": "聊天",
+      "rewritesTarget": false,
+      "role": ""
+    },
+    {
+      "artifactKind": "plot_note",
+      "id": "plot",
+      "label": "剧情推演",
+      "rewritesTarget": false,
+      "role": "outline"
+    },
+    {
+      "artifactKind": "outline_draft",
+      "id": "outline",
+      "label": "细纲",
+      "rewritesTarget": true,
+      "role": "outline"
+    },
+    {
+      "artifactKind": "body_draft",
+      "id": "body",
+      "label": "正文",
+      "rewritesTarget": true,
+      "role": "chapter"
+    },
+    {
+      "artifactKind": "revision",
+      "id": "revise",
+      "label": "修改",
+      "rewritesTarget": true,
+      "role": "review"
+    },
+    {
+      "artifactKind": "review_report",
+      "id": "review",
+      "label": "审稿",
+      "rewritesTarget": false,
+      "role": "review"
+    },
+    {
+      "artifactKind": "humanize_rewrite",
+      "id": "humanize",
+      "label": "去AI味",
+      "rewritesTarget": true,
+      "role": "review"
+    },
+    {
+      "artifactKind": "summary",
+      "id": "summary",
+      "label": "总结",
+      "rewritesTarget": false,
+      "role": "summary"
+    },
+    {
+      "artifactKind": "distill_note",
+      "id": "distill",
+      "label": "蒸馏",
+      "rewritesTarget": false,
+      "role": "distill"
+    }
+  ],
+  "ui": "paper-studio",
+  "writeOps": [
+    "create",
+    "replace",
+    "append",
+    "insert",
+    "replace_range"
+  ]
+}

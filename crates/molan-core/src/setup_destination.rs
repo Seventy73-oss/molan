@@ -268,6 +268,10 @@ pub fn save_selection(db: &Db, args: &Value) -> Result<Value> {
             active_title(&conn, target)?;
             Ok(())
         });
+        if attempt.is_ok() {
+            let src = json!({"service": "book_setup", "messageId": message_id, "index": index});
+            crate::doc_write::record_ai_create(db, target, &group, &name, &content, src);
+        }
         if let Err(error) = attempt {
             // Read through the checked path API; only exact bytes qualify as an idempotent retry.
             if files::read_file(db, target, &group, &name).as_deref() != Some(content.as_str()) {

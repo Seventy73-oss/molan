@@ -1,0 +1,3 @@
+# 脚本与门禁登记表强制 LF：Windows core.autocrlf=true 检出时 CRLF 曾让行数门禁静默失效
+*.sh text eol=lf
+tools/line_budget.txt text eol=lf

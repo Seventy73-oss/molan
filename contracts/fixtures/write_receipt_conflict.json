@@ -1,0 +1,26 @@
+{
+  "actor": "user",
+  "afterHash": null,
+  "beforeHash": null,
+  "bookId": "<id>",
+  "chars": 0,
+  "commit": "conflict",
+  "durationMs": 0,
+  "error": {
+    "code": "BASE_CHANGED",
+    "currentHash": "<sha256>",
+    "message": "文档在你编辑/生成期间已被修改，未写入；请比较后合并或另存"
+  },
+  "group": "设定",
+  "idempotencyKey": "k2",
+  "index": "skipped",
+  "indexError": null,
+  "name": "人物.md",
+  "op": "replace",
+  "recovered": false,
+  "replayed": false,
+  "revision": null,
+  "source": null,
+  "ts": 0,
+  "writeId": "<id>"
+}

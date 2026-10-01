@@ -7,7 +7,6 @@ use super::{book_prefs_block, genre_key, prompts, resolve_book_style};
 use crate::handlers::channel_id;
 use anyhow::anyhow;
 use molan_core::files;
-use molan_core::stats;
 use molan_llm::{chat_once, chat_once_retry_n, ChatParams};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -749,13 +748,8 @@ pub(crate) async fn gen_scene_body(
     }
     // 生成正文后的自动审核去AI味：读本书「自动去味」设置（默认官方标准）
     if !book_id.is_empty() && full.chars().count() >= 300 {
-        let ov = a("humanizeOverride").as_str().unwrap_or("").to_string();
-        let ov = if ov.is_empty() {
-            None
-        } else {
-            Some(ov.as_str())
-        };
-        let (hb, rep) = auto_humanize(db, &book_id, &full, ov, "chapter").await;
+        let hz_plan = super::run_plan::humanize_stage(db, &st.root, &book_id, args);
+        let (hb, rep) = auto_humanize(db, &book_id, &full, &hz_plan, "chapter").await;
         if hb != full {
             full = hb;
             cx.full = full.clone();
@@ -789,30 +783,36 @@ pub(crate) async fn gen_scene_body(
         } else {
             format!("{}\n\n---\n\n{}", existing.trim(), full.trim())
         };
+        let chapter = crate::handlers::chapter_num_from_name(&fname);
         if existing.trim().is_empty() {
-            files::write_ai_file(db, &book_id, molan_core::db::REVIEW_GROUP, &fname, &merged)?;
+            // 首个场景：写盘与待审登记同锁完成（章节提交服务）
+            match chapter {
+                Some(ch) => {
+                    molan_core::chapter_commit::submit_pending(
+                        db,
+                        &book_id,
+                        ch,
+                        &merged,
+                        "",
+                        || Ok(()),
+                    )?;
+                }
+                None => {
+                    use molan_core::chapter_commit::write_review_and_register as wr;
+                    wr(db, &book_id, &fname, &merged, true)?;
+                }
+            }
         } else {
-            // 追加既有待审稿：CAS 保证期间无人改动，且锁定文件会被拒绝
-            files::write_file_cas(
+            // 追加既有待审稿：同锁 CAS 追加 + 重新登记（内容变了即回到 pending）+ 统一回执
+            molan_core::chapter_commit::rewrite_pending(
                 db,
                 &book_id,
-                molan_core::db::REVIEW_GROUP,
                 &fname,
                 &existing,
                 &merged,
+                "append",
+                "decompose.scene_append",
             )?;
-        }
-        if let Some(ch) = crate::handlers::chapter_num_from_name(&fname) {
-            let _ = db.exec(
-                    "INSERT OR REPLACE INTO pending_chapter(book_id,ch,review_file,status,created_at) VALUES(?,?,?,?,?)",
-                    &[
-                        &book_id as &dyn rusqlite::ToSql,
-                        &ch,
-                        &fname,
-                        &"pending",
-                        &stats::now_ms(),
-                    ],
-                );
         }
         if let Some(mid) = a("messageId").as_str() {
             if !mid.is_empty() {
@@ -824,7 +824,7 @@ pub(crate) async fn gen_scene_body(
                     .unwrap_or_default();
                 if let Some(row) = rows.first() {
                     let ctx =
-                        serde_json::from_str::<Value>(row["context_json"].as_str().unwrap_or("{}"))
+                        serde_json::from_str::<Value>(row["contextJson"].as_str().unwrap_or("{}"))
                             .unwrap_or(json!({}));
                     let mut o = if let Value::Object(m) = ctx {
                         m
@@ -833,12 +833,8 @@ pub(crate) async fn gen_scene_body(
                     };
                     o.insert("docName".into(), json!(fname));
                     let _ = db.exec(
-                        "UPDATE messages SET context_json=?, updated_at=? WHERE id=?",
-                        &[
-                            &Value::Object(o).to_string() as &dyn rusqlite::ToSql,
-                            &stats::now_ms(),
-                            &mid,
-                        ],
+                        "UPDATE messages SET context_json=? WHERE id=?",
+                        &[&Value::Object(o).to_string() as &dyn rusqlite::ToSql, &mid],
                     );
                 }
             }

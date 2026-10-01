@@ -87,30 +87,18 @@ where
                 skipped.push(format!("第{}章已有待审稿，未覆盖；请先处理审批队列", num));
                 continue;
             }
-            // 锁内 check：取消/依赖不满足时不落稿
-            if let Err(e) = files::write_ai_file_checked(
-                db,
-                book_id,
-                molan_core::db::REVIEW_GROUP,
-                &fname,
-                &body,
-                &check,
-            ) {
-                skipped.push(format!("第{}章待审落盘失败：{}", num, e));
-                continue;
-            }
-            // 队列登记失败必须报错：吞掉会让「文件已写但审批队列没有」，
-            // 作者在审批界面看不到这篇稿。
-            if let Err(e) = crate::handlers::register_review_queue(db, book_id, &fname, &body) {
-                skipped.push(format!("第{}章文件已写入，但审批队列登记失败：{}", num, e));
-            }
-            let _ = molan_core::chapter_state::record_save(
+            // 锁内 check（取消/依赖）→ 只新建写盘 → 待审登记 → 章节状态，全部在同一把锁内（chapter_commit）
+            if let Err(e) = molan_core::chapter_commit::submit_pending(
                 db,
                 book_id,
                 num,
-                molan_core::db::REVIEW_GROUP,
-                &molan_core::continuity::content_hash(&body),
-            );
+                &body,
+                "chat_save",
+                &check,
+            ) {
+                skipped.push(format!("第{}章待审：{}", num, e));
+                continue;
+            }
             saved.push(format!("{} / {}", molan_core::db::REVIEW_GROUP, fname));
         }
     }

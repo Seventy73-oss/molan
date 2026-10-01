@@ -249,6 +249,245 @@ pub fn finish_run(db: &Db, run_id: &str, status: &str, error: &str) -> Result<()
     Ok(())
 }
 
+/// 可加列（PRAGMA 探测幂等）：用量是否估算、冻结计划、上下文清单、执行模式。
+pub fn ensure_columns(db: &Db) -> Result<()> {
+    ensure_schema(db)?;
+    let conn = db.conn.lock().map_err(|_| anyhow!("数据库锁损坏"))?;
+    let cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(agent_run)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    for (name, ddl) in [
+        (
+            "usage_estimated",
+            "ALTER TABLE agent_run ADD COLUMN usage_estimated INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "plan_hash",
+            "ALTER TABLE agent_run ADD COLUMN plan_hash TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "manifest_id",
+            "ALTER TABLE agent_run ADD COLUMN manifest_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "mode",
+            "ALTER TABLE agent_run ADD COLUMN mode TEXT NOT NULL DEFAULT 'agent'",
+        ),
+        (
+            "metrics_json",
+            "ALTER TABLE agent_run ADD COLUMN metrics_json TEXT NOT NULL DEFAULT '{}'",
+        ),
+    ] {
+        if !cols.iter().any(|c| c == name) {
+            conn.execute_batch(ddl)?;
+        }
+    }
+    Ok(())
+}
+
+/// 记录运行指标（首字时间、模型 / 工具调用耗时、缓存命中、重试、用量来源），随 run_status 返回。
+pub fn set_metrics(db: &Db, run_id: &str, metrics: &Value) -> Result<()> {
+    db.exec(
+        "UPDATE agent_run SET metrics_json=?2 WHERE id=?1",
+        &[&run_id as &dyn rusqlite::ToSql, &metrics.to_string()],
+    )?;
+    Ok(())
+}
+
+/// 记录本次运行冻结的计划与上下文清单（审计/恢复用）。
+pub fn set_plan(
+    db: &Db,
+    run_id: &str,
+    plan_hash: &str,
+    manifest_id: &str,
+    mode: &str,
+) -> Result<()> {
+    db.exec(
+        "UPDATE agent_run SET plan_hash=?2, manifest_id=?3, mode=?4, updated_at=?5 WHERE id=?1",
+        &[
+            &run_id as &dyn rusqlite::ToSql,
+            &plan_hash,
+            &manifest_id,
+            &mode,
+            &now_ms(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// 记账（缺失用量不按 0 计）：上游没给 usage 时按字符数估算并标记 usage_estimated，
+/// 预算照样扣减，绝不把「未知」当成「免费」。返回累计总 tokens。
+pub fn charge_usage_est(
+    db: &Db,
+    run_id: &str,
+    usage: Option<&Value>,
+    est_prompt: i64,
+    est_completion: i64,
+) -> Result<i64> {
+    let real = usage.map(|u| {
+        (
+            usage_i64(u, "prompt_tokens"),
+            usage_i64(u, "completion_tokens"),
+        )
+    });
+    match real {
+        Some((p, c)) if p + c > 0 => charge_usage(db, run_id, usage),
+        _ => {
+            db.exec(
+                "UPDATE agent_run SET used_prompt_tokens=used_prompt_tokens+?2, used_completion_tokens=used_completion_tokens+?3, usage_estimated=1, updated_at=?4 WHERE id=?1",
+                &[&run_id as &dyn rusqlite::ToSql, &est_prompt.max(0), &est_completion.max(0), &now_ms()],
+            )?;
+            Ok(get_run(db, run_id)?
+                .map(|r| {
+                    r["usedPromptTokens"].as_i64().unwrap_or(0)
+                        + r["usedCompletionTokens"].as_i64().unwrap_or(0)
+                })
+                .unwrap_or(0))
+        }
+    }
+}
+
+/// 中文为主文本的粗略 token 估算（宁高勿低）：约 1 字 ≈ 1 token。
+pub fn estimate_tokens(chars: usize) -> i64 {
+    chars as i64
+}
+
+/// 启动对账：上次进程遗留的 running 行不能当成「仍在运行」，也不能自动重跑有副作用的步骤。
+/// 逐行统计已落轮次与产物后标记 interrupted（原因写明），生成中的产物标记 interrupted。返回处理数。
+pub fn reconcile_on_boot(db: &Db) -> Result<usize> {
+    ensure_columns(db)?;
+    let rows = db.q_json("SELECT id FROM agent_run WHERE status='running'", &[])?;
+    for r in &rows {
+        let id = r["id"].as_str().unwrap_or("");
+        let turns = list_turns(db, id).map(|t| t.len()).unwrap_or(0);
+        let arts = db
+            .q_json("SELECT COUNT(*) AS n FROM artifact WHERE run_id=?1", &[&id])
+            .ok()
+            .and_then(|v| v.first().and_then(|x| x["n"].as_i64()))
+            .unwrap_or(0);
+        let why = format!(
+            "服务重启时运行未结束：已记录 {} 条轨迹、{} 个产物；未自动重跑，请检查产物后重新发起",
+            turns, arts
+        );
+        db.exec(
+            "UPDATE agent_run SET status='interrupted', error=?2, updated_at=?3 WHERE id=?1 AND status='running'",
+            &[&id as &dyn rusqlite::ToSql, &why, &now_ms()],
+        )?;
+    }
+    let _ = db.exec(
+        "UPDATE artifact SET lifecycle='interrupted', updated_at=?1 WHERE lifecycle='generating'",
+        &[&now_ms() as &dyn rusqlite::ToSql],
+    );
+    Ok(rows.len())
+}
+
+/// 运行状态映射（旧 status 原样保留；新状态机供界面使用）。
+/// running(+在飞) → running；running(无在飞，旧进程遗留) → interrupted；done → completed；
+/// error / tools_unsupported → failed（附 code）；其余同名。
+pub fn state_of(row: &Value, live: bool) -> Value {
+    let status = row["status"].as_str().unwrap_or("");
+    let (state, label, code) = match status {
+        "running" if live => ("running", "运行中", ""),
+        "running" => ("interrupted", "已中断（无在飞进程）", "ORPHANED"),
+        "done" => ("completed", "已完成", ""),
+        "interrupted" => ("interrupted", "已中断", ""),
+        "budget_exhausted" => ("budget_exhausted", "预算耗尽", "BUDGET_EXHAUSTED"),
+        "tools_unsupported" => ("failed", "当前模型不支持工具调用", "TOOLS_UNSUPPORTED"),
+        "error" => ("failed", "失败", "ERROR"),
+        _ => ("failed", "未知状态", "UNKNOWN"),
+    };
+    serde_json::json!({
+        "runId": row["id"], "requestId": row["requestId"], "sessionId": row["sessionId"],
+        "status": status, "state": state, "stateLabel": label, "code": code, "live": live,
+        "task": row["task"], "mode": row["mode"], "model": row["model"], "error": row["error"],
+        "toolRound": row["toolRound"], "maxToolRounds": row["maxToolRounds"],
+        "usedTokens": row["usedPromptTokens"].as_i64().unwrap_or(0) + row["usedCompletionTokens"].as_i64().unwrap_or(0),
+        "budgetTokens": row["budgetTokens"], "usageEstimated": row["usageEstimated"].as_i64().unwrap_or(0) == 1,
+        "planHash": row["planHash"], "manifestId": row["manifestId"],
+        "metrics": serde_json::from_str::<Value>(row["metricsJson"].as_str().unwrap_or("{}")).unwrap_or(Value::Null),
+        "createdAt": row["createdAt"], "updatedAt": row["updatedAt"],
+    })
+}
+
+#[cfg(test)]
+mod ext_tests {
+    use super::*;
+
+    #[test]
+    fn missing_usage_is_estimated_not_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        let r = begin_run(
+            &db,
+            &BeginRun {
+                book_id: "b".into(),
+                session_id: "s".into(),
+                request_id: "r".into(),
+                task: "chat".into(),
+                model: "m".into(),
+                target_ch: None,
+                max_tool_rounds: 8,
+                budget_tokens: 100,
+            },
+        )
+        .unwrap();
+        let id = r["id"].as_str().unwrap();
+        assert_eq!(charge_usage_est(&db, id, None, 60, 50).unwrap(), 110);
+        assert!(budget_exhausted(&db, id).unwrap(), "估算用量同样扣预算");
+        let row = get_run(&db, id).unwrap().unwrap();
+        assert_eq!(state_of(&row, true)["usageEstimated"], true);
+    }
+
+    #[test]
+    fn boot_reconcile_marks_orphans_interrupted_with_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        let r = begin_run(
+            &db,
+            &BeginRun {
+                book_id: "b".into(),
+                session_id: "s".into(),
+                request_id: "r".into(),
+                task: "chat".into(),
+                model: "m".into(),
+                target_ch: None,
+                max_tool_rounds: 8,
+                budget_tokens: 0,
+            },
+        )
+        .unwrap();
+        let id = r["id"].as_str().unwrap().to_string();
+        record_turn(&db, &id, "assistant", "半截", "", "").unwrap();
+        assert_eq!(
+            state_of(&get_run(&db, &id).unwrap().unwrap(), false)["state"],
+            "interrupted"
+        );
+        assert_eq!(reconcile_on_boot(&db).unwrap(), 1);
+        let row = get_run(&db, &id).unwrap().unwrap();
+        assert_eq!(row["status"], "interrupted");
+        assert!(row["error"].as_str().unwrap().contains("未自动重跑"));
+        // 同 requestId 再发：终态重放，不会因为遗留 running 而永远 already_running
+        let again = begin_run(
+            &db,
+            &BeginRun {
+                book_id: "b".into(),
+                session_id: "s".into(),
+                request_id: "r".into(),
+                task: "chat".into(),
+                model: "m".into(),
+                target_ch: None,
+                max_tool_rounds: 8,
+                budget_tokens: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(again["status"], "interrupted");
+        assert_eq!(again["created"], false);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

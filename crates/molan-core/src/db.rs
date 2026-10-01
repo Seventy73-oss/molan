@@ -62,11 +62,32 @@ impl Db {
         crate::facts::ensure_schema(&db)?;
         crate::ctx_manifest::ensure_schema(&db)?;
         crate::agent_run::ensure_schema(&db)?;
+        crate::doc_write::ensure_schema(&db)?;
+        crate::skill_resolver::ensure_schema(&db)?;
+        crate::artifact::ensure_schema(&db)?;
+        crate::review_log::ensure_schema(&db)?;
+        crate::agent_run::ensure_columns(&db)?;
         // 技能版本化回填：旧库既有行补 rev=1 与真实模板 hash（幂等）
         crate::skill_rev::ensure_backfill(&db)?;
         // 启动自愈中断的审批 saga；失败不阻断启动（审批入口仍按 hash 判据自愈）
         if let Err(e) = crate::approval::recover_approvals(&db) {
             eprintln!("[molan-core] 审批 saga 恢复未完成：{}", e);
+        }
+        // 文档写入两阶段账本对账：崩溃遗留的 prepared 行按磁盘 hash 补记或作废
+        if let Err(e) = crate::doc_write::recover(&db) {
+            eprintln!("[molan-core] 文档写入账本对账未完成：{}", e);
+        }
+        // Agent 运行对账：上次进程遗留的 running 行标记中断（附原因），绝不自动重跑
+        match crate::agent_run::reconcile_on_boot(&db) {
+            Ok(n) if n > 0 => eprintln!("[molan-core] 已对账遗留运行 {} 个（标记为中断）", n),
+            Err(e) => eprintln!("[molan-core] 运行对账未完成：{}", e),
+            _ => {}
+        }
+        // 待审孤儿稿补登（写盘成功而登记失败的历史窗口）：只补缺失记录，不删文件
+        match crate::chapter_commit::repair_orphans(&db) {
+            Ok(n) if n > 0 => eprintln!("[molan-core] 已补登待审孤儿稿 {} 篇", n),
+            Err(e) => eprintln!("[molan-core] 待审孤儿稿修复未完成：{}", e),
+            _ => {}
         }
         Ok(db)
     }

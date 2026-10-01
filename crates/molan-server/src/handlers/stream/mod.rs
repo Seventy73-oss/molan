@@ -143,76 +143,7 @@ fn book_task_skill_ids(db: &molan_core::db::Db, book: &str, task: &str) -> (Stri
 /// 2) 否则按 builtin_key 前缀 / 官方名做任务映射；
 /// 3) 无 targets 的自定义技能按 usage_mode 与任务类别兜底。
 pub(crate) fn skill_targets(row: &Value) -> Vec<String> {
-    if let Some(a) = row["targets"].as_array() {
-        let list: Vec<String> = a
-            .iter()
-            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-            .collect();
-        if !list.is_empty() {
-            return list;
-        }
-    }
-    let name = row["name"].as_str().unwrap_or("");
-    let builtin = row["builtinKey"].as_str().unwrap_or("");
-    let kind = row["kind"].as_str().unwrap_or("");
-    let usage = row["usageMode"].as_str().unwrap_or("");
-    // 内置官方写法 → 任务
-    let by_builtin = |b: &str| -> Option<&'static str> {
-        if b == "method.plot" {
-            Some("plot")
-        } else if b == "method.outline" {
-            Some("outline")
-        } else if b == "method.body" {
-            Some("body")
-        } else if b.starts_with("method.humanize")
-            || b == "method.humanize.standard"
-            || b == "method.humanize.deep"
-        {
-            Some("humanize")
-        } else if b.ends_with("_review")
-            || b == "method.consistency_review"
-            || b == "method.library_audit"
-            || b == "method.opening_review"
-        {
-            Some("review")
-        } else {
-            None
-        }
-    };
-    if let Some(t) = by_builtin(builtin) {
-        return vec![t.to_string()];
-    }
-    // 官方名兜底（与前端 Vu/Gu/Mb 对齐）
-    let by_name = match name {
-        "剧情推演" => Some("plot"),
-        "小说细纲生成" => Some("outline"),
-        "展开正文写作" | "短篇正文" | "短篇节正文生成" => Some("body"),
-        "设定一致性检查"
-        | "爽点节奏分析"
-        | "资料库体检"
-        | "开局诊断"
-        | "试读反馈"
-        | "短篇爆款体检" => Some("review"),
-        "场景描写增强" | "对白润色" | "设定提取" | "拆解手法" => Some("body"),
-        _ => None,
-    };
-    if let Some(t) = by_name {
-        return vec![t.to_string()];
-    }
-    if name.contains("去AI味") || name.contains("去味") || builtin.contains("humanize") {
-        return vec!["humanize".to_string()];
-    }
-    match usage {
-        "primary" => vec!["body".to_string()],
-        "support" => vec!["body".to_string(), "revise".to_string()],
-        _ => {
-            if kind == "craft" {
-                vec!["body".to_string(), "revise".to_string()]
-            } else {
-                vec!["chat".to_string()]
-            }
-        }
-    }
+    molan_core::skill_resolver::targets(row)
 }
 
 /// 该技能是否适用于指定任务（不适用就不注入，避免 body 主卡污染 review 协议）。
@@ -223,67 +154,33 @@ pub(crate) fn skill_applies_to(row: &Value, task: &str) -> bool {
     skill_targets(row).iter().any(|t| t == task)
 }
 
-/// 技能任务路由（N01 / 契约 C）：
-/// 1) 解析并过滤显式技能（启用 + 模板非空 + 本任务适用）；
-/// 2) 只有显式列表里存在「usage=primary 且适用本任务」的写法时，才不再叠加书级主技能；
-/// 3) 叠加书级主技能与辅助技能，按 id 稳定去重。
-///    审核类任务（review/revise）同样遵守，避免自由写作卡污染校验协议。
+/// 技能任务路由（N01 / 契约 C）：旧签名的兼容包装，实际解析统一走
+/// `molan_core::skill_resolver`（显式列表按 usage_mode 判定主/辅；只保留一个主技能；
+/// 停用/空模板/不适用/文风卡一律排除并记录原因；作品主技能被显式主技能替代；作品辅助叠加）。
+/// 任务名经 TaskKind 规范化（chapter→body 等别名在所有入口一致生效）。
 pub(crate) fn effective_skills(
     db: &molan_core::db::Db,
     book: &str,
     task: &str,
     explicit: &[Value],
 ) -> Vec<Value> {
-    let mut out: Vec<Value> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
-    fn push(row: Value, out: &mut Vec<Value>, seen: &mut Vec<String>) {
-        let id = row["id"].as_str().unwrap_or("").to_string();
-        if id.is_empty() || seen.contains(&id) {
-            return;
-        }
-        seen.push(id);
-        out.push(row);
+    let Ok(kind) = molan_core::task_kind::parse_or_chat(task) else {
+        tracing::warn!("未知任务 {:?}，不注入任何技能", task);
+        return Vec::new();
+    };
+    let sel = molan_core::skill_resolver::Selection {
+        legacy: explicit
+            .iter()
+            .filter_map(|v| v.as_str().or(v["id"].as_str()).or(v["name"].as_str()))
+            .map(str::to_string)
+            .collect(),
+        ..Default::default()
+    };
+    let plan = molan_core::skill_resolver::resolve(db, book, kind, &sel);
+    for e in plan["excluded"].as_array().into_iter().flatten() {
+        tracing::info!("技能未注入：{}", e["reason"].as_str().unwrap_or(""));
     }
-    let mut explicit_primary_for_task = false;
-    for v in explicit {
-        let key = v
-            .as_str()
-            .map(|s| s.to_string())
-            .or_else(|| v["id"].as_str().map(|s| s.to_string()))
-            .or_else(|| v["name"].as_str().map(|s| s.to_string()))
-            .unwrap_or_default();
-        if let Some(row) = resolve_skill_ref(db, &key) {
-            // 显式勾选也必须适用于本任务（N01：不能把 body 主卡注入 review）
-            if !skill_applies_to(&row, task) {
-                tracing::info!(
-                    "技能「{}」不适用于任务 {}，本次未注入",
-                    row["name"].as_str().unwrap_or(&key),
-                    task
-                );
-                continue;
-            }
-            if row["usageMode"].as_str() == Some("primary") {
-                explicit_primary_for_task = true;
-            }
-            push(row, &mut out, &mut seen);
-        }
-    }
-    let (primary, supports) = book_task_skill_ids(db, book, task);
-    if !primary.is_empty() && !explicit_primary_for_task {
-        if let Some(row) = resolve_skill_ref(db, &primary) {
-            if skill_applies_to(&row, task) {
-                push(row, &mut out, &mut seen);
-            }
-        }
-    }
-    for s in supports {
-        if let Some(row) = resolve_skill_ref(db, &s) {
-            if skill_applies_to(&row, task) {
-                push(row, &mut out, &mut seen);
-            }
-        }
-    }
-    out
+    plan["skills"].as_array().cloned().unwrap_or_default()
 }
 
 /// DeepWrite 书级绑定技能：与 effective_skills 共用同一个 skill_applies_to 任务路由（N01），
@@ -508,8 +405,10 @@ pub(crate) fn book_config_block(
 
 // The prompt builder receives independently sourced context dimensions; keeping them
 // explicit makes each injection site auditable and avoids an opaque context struct.
+/// 系统提示拼装。去AI味方法由调用方给出（来自冻结计划：本次覆盖 > 作品设置），
+/// 旧版按作品设置自取的 build_system / resolve_humanize_method 已随统一计划服务移除。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_system(
+pub(crate) fn build_system_with(
     db: &molan_core::db::Db,
     root: &std::path::Path,
     book_id: &str,
@@ -518,6 +417,7 @@ pub(crate) fn build_system(
     skills: &[Value],
     user_msg: &str,
     context: &str,
+    humanize: &str,
 ) -> String {
     let p = prompts(root);
     let mut parts: Vec<String> = Vec::new();
@@ -575,7 +475,6 @@ pub(crate) fn build_system(
         parts.push(prefs);
     }
     // 去 AI 味：作者显式选「无」时不得注入（N02 / 契约 C）
-    let humanize = resolve_humanize_method(db, book_id);
     if humanize != "none" {
         if let Some(tone) = p["anti_ai_tone"].as_str() {
             parts.push(tone.to_string());
@@ -590,23 +489,6 @@ pub(crate) fn build_system(
         parts.push(format!("【用户本轮要求】{}", user_msg));
     }
     parts.join("\n\n")
-}
-
-/// 本书去味方法解析（不含提示词）：显式 override > book_humanize__<bookId> > 默认 official:standard。
-/// build_system 只关心是否为 none（关闭）。
-pub(crate) fn resolve_humanize_method(db: &molan_core::db::Db, book_id: &str) -> String {
-    let mut method = String::new();
-    if !book_id.is_empty() {
-        method = molan_llm::get_setting(db, &format!("book_humanize__{}", book_id));
-        if method == "null" {
-            method.clear();
-        }
-    }
-    if method.trim().is_empty() {
-        "official:standard".to_string()
-    } else {
-        method.trim().to_string()
-    }
 }
 
 pub(crate) fn book_prefs_block(db: &molan_core::db::Db, book_id: &str) -> String {
@@ -676,34 +558,7 @@ pub(crate) fn has_body_heading(text: &str) -> bool {
     })
 }
 
-pub(crate) fn context_text(
-    db: &molan_core::db::Db,
-    book_id: &str,
-    context_files: &Value,
-) -> String {
-    let Some(list) = context_files.as_array() else {
-        return String::new();
-    };
-    let mut chunks = Vec::new();
-    for f in list {
-        // 兼容纯字符串条目（runNextChapter 等既有调用方传文件名）：按目录树解析所属组，绝不静默丢弃
-        let name = f["name"].as_str().or_else(|| f.as_str()).unwrap_or("");
-        let group = f["group"]
-            .as_str()
-            .or_else(|| f["groupDir"].as_str())
-            .map(String::from)
-            .or_else(|| stage_context::resolve_file_group(db, book_id, name))
-            .unwrap_or_else(|| "设定".to_string());
-        if let Some(c) = files::read_file(db, book_id, &group, name) {
-            chunks.push(format!(
-                "# 资料：{}\n{}",
-                name,
-                c.chars().take(4000).collect::<String>()
-            ));
-        }
-    }
-    chunks.join("\n\n").chars().take(8000).collect()
-}
+pub(crate) use context_builder::legacy_context_text as context_text;
 
 pub(crate) const ARCHIVE_BUDGET: usize = 3500;
 
@@ -1309,7 +1164,7 @@ pub(crate) fn auto_book_context_for_chapter(
         }
     }
 
-    // 细纲类文件统一遵守 aiOff（自动引用必须过滤作者隐藏项；显式引用走 context_text）。
+    // 细纲类文件统一遵守 aiOff（自动引用与显式附带资料都过滤作者隐藏项，后者在 meta.contextFiles 报告）。
     let read_outline = |name: &str| -> Option<String> {
         if files::file_flag(db, book_id, "细纲", name, "aiOff") {
             return None;
@@ -1482,7 +1337,14 @@ pub async fn dispatch_stream(
                 return Err(anyhow!("会话不存在或不属于当前书"));
             }
             let run = molan_core::agent_run::latest_run_for_session(db, &session_id)?;
-            Ok(Some(json!({ "run": run })))
+            // 附加状态机视图：无在飞进程的 running 行如实显示为中断，不再误导前端提供「停止」
+            let state = run.as_ref().map(|r| {
+                molan_core::agent_run::state_of(
+                    r,
+                    agent_runtime::is_live(r["id"].as_str().unwrap_or("")),
+                )
+            });
+            Ok(Some(json!({ "run": run, "state": state })))
         }
         // ============ 手动线（作者逐章确认）：单章正文起草 + 细纲确认 ============
         "draft_chapter" => return chapter_service::draft_chapter_stream(st, cmd, args, tx).await,
@@ -1530,7 +1392,10 @@ pub async fn dispatch_stream(
         }
         "set_agent_profile" => {
             let task = s("task");
-            if !["distill", "outline", "chapter", "review", "summary"].contains(&task.as_str()) {
+            // chat = Agent 运行（agent_turn）使用的模型；其余为写作链各角色
+            if !["chat", "distill", "outline", "chapter", "review", "summary"]
+                .contains(&task.as_str())
+            {
                 return Err(anyhow!("未知任务角色：{}", task));
             }
             let profile = json!({
@@ -1584,16 +1449,20 @@ mod auto_write;
 // B: 按「实际批准章 + hash」事件化写入正式记忆（F 审批成功 / rebuild_memory 调用；幂等）
 pub(crate) use auto_write::post_approved_chapter;
 pub(crate) mod agent_loop;
+pub(crate) mod agent_runtime;
 mod agent_tools;
 pub(crate) mod chapter_review;
 pub(crate) mod chapter_service;
 pub(crate) mod chat;
 mod chat_save;
+pub(crate) mod context_builder;
 mod decompose;
 pub(crate) mod fallback;
+pub(crate) mod run_plan;
 pub(crate) mod skill_plan;
 mod sources;
 pub(crate) mod stage_context;
+pub(crate) mod tool_exec;
 
 #[cfg(test)]
 mod helper_tests {

@@ -178,32 +178,8 @@ pub fn strict_agent_instructions(db: &Db, book_id: &str, role: &str) -> Result<S
     ))
 }
 
-/// Return book-bound skill prompts that are not already present in the stage prompt.
-/// Call this only for creative stages; strict JSON review/memory protocols must stay clean.
-pub fn skill_instructions(db: &Db, book_id: &str, existing_prompt: &str) -> Result<String> {
-    require_book(db, book_id)?;
-    let skills = db.q_json(
-        "SELECT s.name,s.prompt_template FROM dw_book_skill b JOIN skills s ON s.id=b.skill_id WHERE b.book_id=?1 AND b.enabled=1 AND s.enabled=1 AND trim(s.prompt_template)<>'' ORDER BY s.name",
-        &[&book_id as &dyn ToSql],
-    )?;
-    let mut out = String::new();
-    for skill in skills {
-        let prompt = skill["promptTemplate"].as_str().unwrap_or("");
-        let clipped: String = prompt.chars().take(4_000).collect();
-        if clipped.trim().is_empty() || existing_prompt.contains(&clipped) {
-            continue;
-        }
-        if out.is_empty() {
-            out.push_str("【本书绑定技能】");
-        }
-        out.push_str(&format!(
-            "\n- {}：{}",
-            skill["name"].as_str().unwrap_or("技能"),
-            clipped
-        ));
-    }
-    Ok(out)
-}
+// 本书 DeepWrite 绑定技能不再由这里拼接注入：统一经 SkillResolver 的 `deepwrite` 来源
+// （Selection.deepwrite）解析——同样校验启用/模板/任务适用性、按 id 去重，并随计划冻结。
 
 pub fn context_bundle(db: &Db, book_id: &str, max_chars: usize) -> Result<Value> {
     require_book(db, book_id)?;
@@ -371,6 +347,28 @@ pub fn accept_proposal(db: &Db, book_id: &str, id: &str) -> Result<Value> {
     if let Err(e) = files::write_file_cas_locked(db, book_id, group, name, base, proposed) {
         let msg = e.to_string();
         let now = now_ms();
+        // 文件已落盘、只是派生索引失败：状态必须是 accepted（附错误），绝不回滚为 pending——
+        // 否则重试时 CAS 基线已不成立，提案永远无法再接受（旧缺陷）。
+        if files::read_file(db, book_id, group, name).as_deref() == Some(proposed) {
+            ledger(
+                db,
+                book_id,
+                group,
+                name,
+                base,
+                proposed,
+                id,
+                Some(msg.clone()),
+            );
+            db.exec(
+                "UPDATE dw_change_proposal SET status='accepted',error=?2,applied_at=?3,updated_at=?3 WHERE id=?1 AND book_id=?4 AND status='applying'",
+                &[&id as &dyn ToSql, &msg, &now, &book_id],
+            )?;
+            return Ok(json!({
+                "ok": true, "id": id, "status": "accepted", "bookId": book_id, "group": group, "name": name,
+                "appliedHash": crate::continuity::content_hash(proposed), "indexError": msg,
+            }));
+        }
         let _ = db.exec(
             "UPDATE dw_change_proposal SET status='pending',error=?2,updated_at=?3 WHERE id=?1 AND book_id=?4 AND status='applying'",
             &[&id as &dyn ToSql, &msg, &now, &book_id],
@@ -385,12 +383,41 @@ pub fn accept_proposal(db: &Db, book_id: &str, id: &str) -> Result<Value> {
     if changed != 1 {
         bail!("提案状态提交失败：文件已写入但状态未翻转，请从版本历史核查");
     }
+    ledger(db, book_id, group, name, base, proposed, id, None);
     // appliedHash：实际落盘内容（=proposed）的指纹。手动线前端用它作 confirm_outline 的
     // expectedHash（接受→确认一步链，绑定作者刚接受的那一版），不在客户端算 hash。
     Ok(json!({
         "ok":true,"id":id,"status":"accepted","bookId":book_id,"group":group,"name":name,
         "appliedHash": crate::continuity::content_hash(proposed),
     }))
+}
+
+/// 提案接受的统一写入回执（DocumentWriteService 账本）：基线为空即新建，否则为整篇替换。
+#[allow(clippy::too_many_arguments)]
+fn ledger(
+    db: &Db,
+    book: &str,
+    group: &str,
+    name: &str,
+    base: &str,
+    new: &str,
+    id: &str,
+    idx: Option<String>,
+) {
+    let (op, before) = if base.is_empty() {
+        ("create", None)
+    } else {
+        ("replace", Some(crate::continuity::content_hash(base)))
+    };
+    let src = json!({"service": "deepwrite.accept_proposal", "proposalId": id});
+    let after = crate::continuity::content_hash(new);
+    let n = new.chars().count() as i64;
+    let actor = crate::doc_write::Actor::Ai;
+    if let Err(e) = crate::doc_write::record_external(
+        db, book, group, name, op, actor, before, &after, n, idx, src,
+    ) {
+        eprintln!("[molan-core] 提案写入回执记账失败（文件已保存）：{}", e);
+    }
 }
 
 pub fn reject_proposal(db: &Db, book_id: &str, id: &str, reason: &str) -> Result<Value> {
@@ -478,12 +505,22 @@ mod tests {
         bind_skill(&db, &a, "s1", true).unwrap();
         let ins = agent_instructions(&db, &a, "planner").unwrap();
         assert!(!ins.contains("本书绑定技能"));
-        let skills = skill_instructions(&db, &a, &ins).unwrap();
-        assert!(skills.contains("节奏：模板"));
-        assert_eq!(
-            skill_instructions(&db, &a, &format!("{}\n模板", ins)).unwrap(),
-            ""
-        );
+        // 绑定技能经 SkillResolver 的 deepwrite 来源进入计划，且只作用于本书
+        let sel = crate::skill_resolver::Selection {
+            deepwrite: true,
+            ..Default::default()
+        };
+        let ids = |book: &str| {
+            crate::skill_resolver::resolve(&db, book, crate::task_kind::TaskKind::Revise, &sel)
+                ["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| (s["id"].as_str().unwrap().to_string(), s["source"].clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&a), vec![("s1".to_string(), json!("deepwrite"))]);
+        assert!(ids(&b).is_empty());
         assert_eq!(
             list_skill_bindings(&db, &a)
                 .unwrap()
@@ -523,6 +560,18 @@ mod tests {
         assert_eq!(
             files::read_file(&db, &book, "正文", "第1章.md").as_deref(),
             Some("新稿")
+        );
+        // 提案接受与其他写入共用同一份写入回执账本
+        let h = crate::doc_write::history(&db, &book, "正文", "第1章.md", 5).unwrap();
+        assert_eq!(h[0]["source"]["service"], "deepwrite.accept_proposal");
+        assert_eq!(h[0]["op"], "replace");
+        assert_eq!(
+            h[0]["beforeHash"],
+            json!(crate::continuity::content_hash("原稿"))
+        );
+        assert_eq!(
+            h[0]["afterHash"],
+            json!(crate::continuity::content_hash("新稿"))
         );
         let p2 =
             create_proposal(&db, &book, "editor", "正文", "第1章.md", "再润色", "提案稿").unwrap();

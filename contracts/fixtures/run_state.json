@@ -1,0 +1,44 @@
+{
+  "budgetTokens": 200000,
+  "code": "",
+  "createdAt": 0,
+  "error": "",
+  "live": false,
+  "manifestId": "<id>",
+  "maxToolRounds": 8,
+  "metrics": {
+    "cacheHits": 0,
+    "firstTokenMs": 0,
+    "modelCalls": [
+      {
+        "firstTextMs": 0,
+        "firstTokenMs": 0,
+        "outcome": "ok",
+        "outputChars": 1202,
+        "promptChars": 540,
+        "totalMs": 0,
+        "usage": null,
+        "usageSource": "estimated"
+      }
+    ],
+    "retries": 0,
+    "toolMs": 0,
+    "tools": [],
+    "totalMs": 0,
+    "usageEstimated": true
+  },
+  "mode": "agent",
+  "model": "mock-model",
+  "planHash": "<sha256>",
+  "requestId": "rq",
+  "runId": "<id>",
+  "sessionId": "<id>",
+  "state": "completed",
+  "stateLabel": "已完成",
+  "status": "done",
+  "task": "chat",
+  "toolRound": 0,
+  "updatedAt": 0,
+  "usageEstimated": true,
+  "usedTokens": 1742
+}

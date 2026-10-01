@@ -1,14 +1,13 @@
 // 自动写作引擎：任务运行态/实时进度日志/逐章生成（细纲→正文→审核→去味→落盘→章后处理）/空洞回补。
 use super::super::AppState;
-use super::build_system;
 use super::{
-    auto_book_context_for_chapter, effective_skills, extract_json_block, log_llm_usage, prompts,
-    write_ai_file_async,
+    auto_book_context_for_chapter, extract_json_block, log_llm_usage, prompts, write_ai_file_async,
 };
 use crate::handlers::chapter_num_from_name;
 use anyhow::anyhow;
 use molan_core::files;
 use molan_core::stats;
+use molan_core::task_kind::TaskKind;
 use molan_llm::ChatParams;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -127,7 +126,7 @@ async fn commit_chapter_file(
         // 闭包需 move 捕获，故克隆句柄供锁内校验使用（外部仍保留 st2/b 做回读校验）
         let st3 = Arc::clone(&st2);
         let b3 = b.clone();
-        let res = files::write_ai_file_checked(&st2.db, &b, &g, &n, &c, move || {
+        let check = move || {
             // 锁内：再次确认未取消
             if is_cancelled_now() {
                 cancel_flag2.store(true, Ordering::SeqCst);
@@ -142,7 +141,15 @@ async fn commit_chapter_file(
                 }
             }
             Ok(())
-        });
+        };
+        // 待审稿：写盘与待审登记在同一把锁内完成（章节提交服务），杜绝「有稿无队列」孤儿
+        let res = match crate::handlers::chapter_num_from_name(&n) {
+            Some(ch) if g == molan_core::db::REVIEW_GROUP => {
+                molan_core::chapter_commit::submit_pending(&st2.db, &b, ch, &c, "", check)
+                    .map(|_| ())
+            }
+            _ => files::write_ai_file_checked(&st2.db, &b, &g, &n, &c, check),
+        };
         if let Err(e) = res {
             if cancel_flag.load(Ordering::SeqCst) {
                 return CommitOutcome::Cancelled;
@@ -170,24 +177,6 @@ fn freeze_inputs(db: &molan_core::db::Db, book_id: &str, ch: i64) -> anyhow::Res
     let target = ch + 1;
     let fp = molan_core::continuity::input_fingerprint(db, book_id, target)?;
     Ok((target, fp))
-}
-
-#[allow(dead_code)]
-/// 仅当文件当前内容与调用方读到的 expected 一致时才写入（本地 CAS-lite）：
-/// 人工/AI 已改动则放弃写入，绝不覆盖别人刚写的内容。
-async fn write_if_unchanged(
-    st: &Arc<AppState>,
-    book_id: &str,
-    group: &str,
-    name: &str,
-    expected: &str,
-    content: &str,
-) -> CommitOutcome {
-    let now = files::read_file(&st.db, book_id, group, name).unwrap_or_default();
-    if now != expected {
-        return CommitOutcome::Failed(format!("文件已被改动，放弃覆盖：{} / {}", group, name));
-    }
-    commit_chapter_file(st, book_id, group, name, content, None).await
 }
 
 /// 自动写作实时进度日志（前端在对话流里轮询渲染进度卡片）
@@ -421,6 +410,7 @@ async fn review_and_fix_chapter(
         pending_block,
         body,
         auto_cancel_token(),
+        &frozen_plan(st, book_id, TaskKind::Review),
     )
     .await;
     if outcome.flagged {
@@ -451,11 +441,12 @@ async fn review_and_fix_chapter(
             sys2.push_str(&project_agent);
         }
     }
-    if let Ok(skills) = molan_core::deepwrite::skill_instructions(db, book_id, &sys2) {
-        if !skills.is_empty() {
-            sys2.push_str("\n\n");
-            sys2.push_str(&skills);
-        }
+    // 重写子阶段：按「修改」任务解析的冻结计划（含 DeepWrite 绑定），不读最新模板
+    let skills =
+        super::run_plan::stage_skills_text(&frozen_plan(st, book_id, TaskKind::Revise), &sys2);
+    if !skills.is_empty() {
+        sys2.push_str("\n\n");
+        sys2.push_str(&skills);
     }
     let user2 = format!(
         "【本章正文】\n{}\n\n【责编意见】\n{}\n{}\n\n请重写本章正文，第一行保持「第{}章 章名」，直接输出正文，不要任何说明。",
@@ -537,6 +528,7 @@ async fn review_and_fix_chapter(
             pending_block,
             &t,
             auto_cancel_token(),
+            &frozen_plan(st, book_id, TaskKind::Review),
         )
         .await
         {
@@ -619,6 +611,30 @@ enum ChapOutcome {
     Cancelled,
 }
 
+/// 本任务冻结的技能计划。任务开始时按作者本次选择解析并冻结；旧任务续跑或缺失时按作品默认解析并冻结。
+fn frozen_plan(st: &Arc<AppState>, book_id: &str, task: TaskKind) -> Value {
+    let hash = AUTO_RUN.lock().ok().and_then(|g| {
+        g.as_ref()
+            .and_then(|v| v["plans"][task.id()].as_str().map(str::to_string))
+    });
+    if let Some(p) = hash.and_then(|h| molan_core::skill_resolver::load_frozen(&st.db, &h)) {
+        return p;
+    }
+    let p = match task {
+        TaskKind::Revise | TaskKind::Humanize | TaskKind::Review => {
+            super::run_plan::stage_plan(&st.db, &st.root, book_id, task, &Default::default())
+        }
+        _ => super::run_plan::build(&st.db, &st.root, book_id, task, &Default::default())
+            .unwrap_or(Value::Null),
+    };
+    if let (Ok(mut g), Some(h)) = (AUTO_RUN.lock(), p["planHash"].as_str()) {
+        if let Some(v) = g.as_mut() {
+            v["plans"][task.id()] = json!(h);
+        }
+    }
+    p
+}
+
 async fn write_one_chapter(
     st: &Arc<AppState>,
     book_id: &str,
@@ -663,7 +679,8 @@ async fn write_one_chapter(
         // 不再手拼档案/人物/上一章，避免细纲阶段绕过 aiOff 与时间轴约束。
         let outline_ctx = auto_book_context_for_chapter(db, book_id, ch, include_pending);
         // 细纲任务技能路由：主/辅助按 task=outline 解析，过滤禁用与空模板
-        let outline_skills = effective_skills(db, book_id, "outline", &[]);
+        let outline_skills =
+            super::run_plan::skill_rows(&frozen_plan(st, book_id, TaskKind::Outline));
         let mut sys = String::from(
             "你是网文责编，为本章生成走向级细纲。只输出细纲正文（markdown），包含：本章目标 / 冲突与对手 / 看点与爽点 / 章末钩子。紧扣提供的设定、前情与上一章结尾，不得与人物表矛盾。不超过300字。",
         );
@@ -798,9 +815,10 @@ async fn write_one_chapter(
             v.first()
                 .and_then(|r| r["genre"].as_str().map(|x| x.to_string()))
         });
-    let style: Option<String> = resolve_book_style(db, &st.root, book_id, book_genre.as_deref());
-    // 技能路由（契约 C）：正文任务的主/辅助技能，过滤禁用与空模板，稳定去重
-    let body_skills = effective_skills(db, book_id, "body", &[]);
+    // 技能/文风/去味取自任务开始时冻结的计划：整批章节同一快照，运行中编辑技能不改变本任务
+    let body_plan = frozen_plan(st, book_id, TaskKind::Body);
+    let style: Option<String> = super::run_plan::style_text(&body_plan);
+    let body_skills = super::run_plan::skill_rows(&body_plan);
     if !body_skills.is_empty() {
         let ids: Vec<String> = body_skills
             .iter()
@@ -812,7 +830,7 @@ async fn write_one_chapter(
             format!("第{}章 生效技能：{}", ch, ids.join("、")),
         );
     }
-    let mut sys = build_system(
+    let mut sys = super::build_system_with(
         db,
         &st.root,
         book_id,
@@ -821,6 +839,7 @@ async fn write_one_chapter(
         &body_skills,
         &msg,
         &context,
+        &super::run_plan::humanize_method(&body_plan),
     );
     for role in ["character", "editor"] {
         let project_agent = molan_core::deepwrite::agent_instructions(db, book_id, role)
@@ -1059,7 +1078,8 @@ async fn write_one_chapter(
 
     // ---- 2.5) 去AI味审核层：读本书「自动去味」设置（默认官方标准），机器门 + 整合门 ----
     auto_log(ch, "deai", format!("第{}章 去AI味中…", ch));
-    let (body, report) = auto_humanize(db, book_id, &body, None, "chapter").await;
+    let hz_plan = frozen_plan(st, book_id, TaskKind::Humanize);
+    let (body, report) = auto_humanize(db, book_id, &body, &hz_plan, "chapter").await;
     let deai_note = format!(
         "去AI味：{}分/{}（{}项·{}）",
         report["score"].as_i64().unwrap_or(0),
@@ -1117,6 +1137,7 @@ async fn write_one_chapter(
             &pending_block,
             &body,
             auto_cancel_token(),
+            &frozen_plan(st, book_id, TaskKind::Review),
         )
         .await
         {
@@ -1193,10 +1214,6 @@ async fn write_one_chapter(
                     None,
                 )
                 .await;
-                let _ = db.exec(
-                    "INSERT OR REPLACE INTO pending_chapter(book_id,ch,review_file,status,created_at) VALUES(?,?,?,?,?)",
-                    &[&book_id as &dyn rusqlite::ToSql, &ch, &name, &"pending", &stats::now_ms()],
-                );
                 // 按磁盘实况记账：待审稿确实存在才记 DRAFT_REVIEW，再如实落到 STALE_DEPENDENCY
                 if let Some(draft) =
                     files::read_file(db, book_id, molan_core::db::REVIEW_GROUP, &name)
@@ -1225,13 +1242,14 @@ async fn write_one_chapter(
             }
         }
         let final_hash = text_fingerprint(&body);
-        // 不可变批准事件：区分"系统批准过此 hash"与"作者后来改稿"
-        if let Err(e) = molan_core::continuity::record_approval(db, book_id, ch, &name, &final_hash)
+        // 不可变批准回执 + 队列状态同一事务提交（旧实现分两步，中途失败会留下不一致）
+        if let Err(e) =
+            molan_core::chapter_commit::record_auto_approved(db, book_id, ch, &name, &final_hash)
         {
             auto_log(
                 ch,
                 "memory",
-                format!("第{}章 定稿已保存，但批准事件记录失败：{}", ch, e),
+                format!("第{}章 定稿已保存，但批准记录失败：{}", ch, e),
             );
             save_auto_message(
                 db,
@@ -1246,20 +1264,6 @@ async fn write_one_chapter(
             ch,
             json!({"finalHash": final_hash, "by": "full_auto"}),
         );
-        // 队列状态与正式稿对齐（DB 失败只告警，绝不删除已写正文）
-        if let Err(e) = db.exec(
-            "INSERT OR REPLACE INTO pending_chapter(book_id,ch,review_file,status,created_at) VALUES(?,?,?,?,?)",
-            &[
-                &book_id as &dyn rusqlite::ToSql,
-                &ch,
-                &name,
-                &"approved",
-                &stats::now_ms(),
-            ],
-        ) {
-            auto_log(ch, "error", format!("第{}章 正文已写，但审批队列状态更新失败：{}", ch, e));
-            save_auto_message(db, session_id, "user", &format!("【全自动】第{}章 正文已保存，队列状态未同步（{}）", ch, e));
-        }
         save_auto_message(
             db,
             session_id,
@@ -1359,21 +1363,6 @@ async fn write_one_chapter(
                 body.trim().chars().count()
             ),
         );
-        // 记录到审批队列：队列是"可接受成果"的唯一入口，写失败不能算成功
-        if let Err(e) = db.exec(
-            "INSERT OR REPLACE INTO pending_chapter(book_id,ch,review_file,status,created_at) VALUES(?,?,?,?,?)",
-            &[
-                &book_id as &dyn rusqlite::ToSql,
-                &ch,
-                &name,
-                &"pending",
-                &stats::now_ms(),
-            ],
-        ) {
-            auto_log(ch, "error", format!("第{}章 待审已写盘但队列登记失败：{}", ch, e));
-            save_auto_message(db, session_id, "user", &format!("【自动写作】第{}章 待审稿已保存，但审批队列登记失败（{}）", ch, e));
-            return Ok(ChapOutcome::GenFailed(format!("审批队列登记失败：{}", e)));
-        }
         // 登记本章草稿的任务来源（精确 provenance）——必须在依赖记录之前，
         // 否则后续章的 pending_for_task 永远取不到上一章，待审连写会静默失效。
         let task_id = AUTO_RUN
@@ -2475,6 +2464,20 @@ pub(crate) async fn auto_write_start(
         .ok()
         .and_then(|v| v.first().and_then(|r| r["id"].as_i64()))
         .unwrap_or(0);
+    // 本次技能计划（作者本次选择 > 作品默认）：任务开始即冻结，整批章节共用同一快照
+    let sel = molan_core::skill_resolver::Selection::from_args(args);
+    let plan_hash = |t: TaskKind| {
+        super::run_plan::build(db, &st.root, &book_id, t, &sel)
+            .ok()
+            .map(|p| p["planHash"].clone())
+    };
+    // 子阶段（审稿后重写 / 去AI味）按各自任务解析，同时冻结
+    let stage = |t: TaskKind| {
+        super::run_plan::stage_plan(db, &st.root, &book_id, t, &sel)["planHash"].clone()
+    };
+    let plans = json!({"body": plan_hash(TaskKind::Body), "outline": plan_hash(TaskKind::Outline),
+        "revise": stage(TaskKind::Revise), "humanize": stage(TaskKind::Humanize),
+        "review": stage(TaskKind::Review)});
     {
         let mut g = AUTO_RUN.lock().unwrap();
         *g = Some(json!({
@@ -2482,7 +2485,7 @@ pub(crate) async fn auto_write_start(
             "from": from, "to": to, "current": 0,
             "running": true, "error": "",
             // 冻结任务模式：运行期间改设置不影响本任务
-            "fullAuto": full_auto_snapshot,
+            "fullAuto": full_auto_snapshot, "plans": plans,
         }));
     }
     AUTO_STOP.store(false, Ordering::SeqCst);
@@ -2790,77 +2793,33 @@ pub(crate) async fn auto_write_stop(
     Ok(Some(json!({"ok": true, "stopping": true})))
 }
 
-/// 解析「自动去味」方法：显式 override > 本书设置 book_humanize__<bookId> > official:standard。
-/// 返回 (方法标识, 方法提示词)；方法为 "none" 时提示词为空 = 关闭自动去味。
-///
-/// **humanizeOverride 三态契约（全仓唯一实现，chat.rs deai 分支与批量链共用）**：
-/// - `""`（空串/None/纯空白）= 未指定 → 回落书级 `book_humanize__<bookId>`；
-///   书级也缺失（或值为 "null"）→ 再缺省 `official:standard`。
-/// - `"none"` = **明确关闭**：返回 ("none", "")，不注入任何方法提示词。
-///   注意这不会回落到书级设置——显式关闭必须压过书级默认。
-/// - `"official:*"` / `"skill:<id>"` = 显式指定，按对应内置键或技能模板取提示词。
-///
-/// 历史教训：chat.rs 内联版曾把 "none" 当作「未指定」回落书级，与批量链语义相反，
-/// 导致同一 override 在两条路径上行为分叉；本函数是统一后的唯一真源。
+/// 去AI味方法 → (method, 提示词)。唯一实现是 run_plan::humanize_for（停用/空模板技能回落官方标准并说明）；
+/// 保留旧签名给旧聊天「去AI味」改写与 plan_stage 预览使用。
 pub(crate) fn resolve_humanize(
     db: &molan_core::db::Db,
     book_id: &str,
     override_method: Option<&str>,
 ) -> (String, String) {
-    let mut method = override_method.unwrap_or("").trim().to_string();
-    if method.is_empty() && !book_id.is_empty() {
-        method = molan_llm::get_setting(db, &format!("book_humanize__{}", book_id));
-        if method == "null" {
-            method.clear();
-        }
-    }
-    if method.is_empty() {
-        method = "official:standard".to_string();
-    }
-    if method == "none" {
-        return (method, String::new());
-    }
-    let prompt = if let Some(sid) = method.strip_prefix("skill:") {
-        db.q_json(
-            "SELECT prompt_template FROM skills WHERE id=?1 OR builtin_key=?1",
-            &[&sid as &dyn rusqlite::ToSql],
-        )
-        .ok()
-        .and_then(|v| {
-            v.first()
-                .and_then(|r| r["promptTemplate"].as_str().map(|x| x.to_string()))
-        })
-        .unwrap_or_default()
-    } else {
-        let key = if method == "official:deep" {
-            "method.humanize.deep"
-        } else {
-            "method.humanize.standard"
-        };
-        db.q_json(
-            "SELECT prompt_template FROM skills WHERE builtin_key=?1",
-            &[&key as &dyn rusqlite::ToSql],
-        )
-        .ok()
-        .and_then(|v| {
-            v.first()
-                .and_then(|r| r["promptTemplate"].as_str().map(|x| x.to_string()))
-        })
-        .unwrap_or_default()
-    };
-    (method, prompt)
+    let h = super::run_plan::humanize_for(db, book_id, override_method);
+    let get = |k: &str| h[k].as_str().unwrap_or("").to_string();
+    (get("method"), get("text"))
 }
 
 /// 生成正文后的自动审核去AI味：机器门评分 → 未过线则按所选方法修（最多 2 轮）。
 /// 任何异常都退回原文，绝不阻断生成。返回 (最终正文, 审核报告)。
+/// `plan` 是按「去AI味」任务解析并冻结的子阶段计划（run_plan::stage_plan）：方法、模板与技能都取自快照。
 pub(crate) async fn auto_humanize(
     db: &molan_core::db::Db,
     book_id: &str,
     body: &str,
-    override_method: Option<&str>,
+    plan: &Value,
     agent: &str,
 ) -> (String, Value) {
-    let (method, method_prompt) = resolve_humanize(db, book_id, override_method);
+    let method = plan["humanize"]["method"]
+        .as_str()
+        .unwrap_or("official:standard")
+        .to_string();
+    let method_prompt = plan["humanize"]["text"].as_str().unwrap_or("").to_string();
     let mut report = molan_core::deai::score_text(body);
     if method == "none" {
         report["skipped"] = json!("自动去味已关闭");
@@ -2922,11 +2881,10 @@ pub(crate) async fn auto_humanize(
                 sys.push_str(&extra);
             }
         }
-        if let Ok(skills) = molan_core::deepwrite::skill_instructions(db, book_id, &sys) {
-            if !skills.is_empty() {
-                sys.push_str("\n\n");
-                sys.push_str(&skills);
-            }
+        let skills = super::run_plan::stage_skills_text(plan, &sys);
+        if !skills.is_empty() {
+            sys.push_str("\n\n");
+            sys.push_str(&skills);
         }
         if shrink_retry {
             sys.push_str("\n【本次特别要求】上一版修复稿因删减过多被退回：本次必须完整保留全部信息与情节细节，只改表达，字数不得少于原文的 95%。");
@@ -2985,6 +2943,7 @@ pub(crate) async fn auto_humanize(
     }
     report["rounds"] = json!(round);
     report["method"] = json!(method);
+    report["planHash"] = plan["planHash"].clone();
     (cur, report)
 }
 

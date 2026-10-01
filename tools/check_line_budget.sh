@@ -8,10 +8,16 @@ LIST="$(cd "$(dirname "$0")" && pwd)/line_budget.txt"
 CAP_NEW=800
 fail=0
 TAB=$(printf '\t')
+CR=$(printf '\r')
 if [ -f "$LIST" ]; then
   while IFS="$TAB" read -r path max; do
+    # Windows 检出（core.autocrlf=true）每行带 CR：先剥掉再比较。
+    # 旧实现在 CRLF 下每条登记都报 "integer expression expected" 并被静默跳过，门禁形同虚设。
+    path=${path%"$CR"}
+    max=${max%"$CR"}
     [ -z "$path" ] && continue
     case "$path" in \#*) continue;; esac
+    case "$max" in ''|*[!0-9]*) echo "[line-budget] 登记值非法: $path=[$max]"; fail=1; continue;; esac
     f="$ROOT/$path"
     if [ ! -f "$f" ]; then echo "[line-budget] 登记文件缺失: $path"; fail=1; continue; fi
     cur=$(wc -l < "$f" | tr -d ' ')
@@ -20,7 +26,7 @@ if [ -f "$LIST" ]; then
       fail=1
     fi
   done < "$LIST"
-  cut -f1 "$LIST" > /tmp/lb_reg.$$
+  cut -f1 "$LIST" | tr -d '\r' > /tmp/lb_reg.$$
 else
   : > /tmp/lb_reg.$$
 fi

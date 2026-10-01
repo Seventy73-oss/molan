@@ -4,9 +4,7 @@ use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
 const DEFAULT_TASK: &str = "chat";
-const ALLOWED_TASKS: [&str; 9] = [
-    "chat", "plot", "outline", "body", "revise", "review", "humanize", "summary", "distill",
-];
+const ALLOWED_TASKS: [&str; 9] = molan_core::task_kind::IDS;
 
 /// Resolve the effective task kind from a chat request payload: non-empty
 /// `args.task` first, then `skillSelection.taskKind`, else `chat`. Values

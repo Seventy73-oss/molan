@@ -1,0 +1,73 @@
+{
+  "actions": [
+    {
+      "id": "save_outline",
+      "label": "保存到细纲",
+      "primary": true
+    },
+    {
+      "id": "save_as",
+      "label": "另存为文档",
+      "primary": false
+    },
+    {
+      "id": "edit",
+      "label": "编辑后保存为新修订",
+      "primary": false
+    },
+    {
+      "id": "copy",
+      "label": "复制全文",
+      "primary": false
+    },
+    {
+      "id": "discard",
+      "label": "放弃",
+      "primary": false
+    }
+  ],
+  "bookId": "<id>",
+  "chars": 13,
+  "content": "# 第1章细纲\n冲突与钩子",
+  "contentHash": "<sha256>",
+  "createdAt": 0,
+  "deliveries": [],
+  "format": "markdown",
+  "id": "<id>",
+  "item": {
+    "chars": 13,
+    "content": null,
+    "group": null,
+    "hash": "<sha256>",
+    "index": 0,
+    "location": null,
+    "name": null,
+    "note": "",
+    "state": "generated",
+    "stateLabel": "已生成，尚未保存",
+    "title": "第1章细纲"
+  },
+  "items": [],
+  "kind": "outline_draft",
+  "kindLabel": "细纲草稿",
+  "legacy": false,
+  "lifecycle": "generated",
+  "messageId": "",
+  "origin": "model",
+  "provenance": null,
+  "rev": 1,
+  "runId": "",
+  "scope": "document",
+  "sessionId": "S",
+  "state": "generated",
+  "stateLabel": "已生成，尚未保存",
+  "summary": "",
+  "target": {
+    "ch": 1
+  },
+  "task": "outline",
+  "taskLabel": "细纲",
+  "title": "第1章细纲",
+  "truncated": false,
+  "updatedAt": 0
+}

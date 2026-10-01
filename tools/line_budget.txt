@@ -1,25 +1,26 @@
-crates/molan-server/src/handlers/mod.rs	3070
-crates/molan-server/src/handlers/stream/mod.rs	2075
-crates/molan-server/src/handlers/stream/chat.rs	1880
-crates/molan-server/src/handlers/stream/auto_write.rs	3557
-crates/molan-core/src/files.rs	2078
+# Paper Studio 重构（2026-10）：服务收敛后各登记文件实际行数下降，登记值同步下调锁定成果（只减不增）。
+crates/molan-server/src/handlers/mod.rs	2875
+crates/molan-server/src/handlers/stream/mod.rs	1879
+crates/molan-server/src/handlers/stream/chat.rs	1801
+crates/molan-server/src/handlers/stream/auto_write.rs	3187
+crates/molan-core/src/files.rs	2042
 # glue.js 2732->3210：存量业务本就超预算（本次改动前实测 3196 行，超 464 行，非本次新增导致）。
 # 构成：设置页写作面板（范围/双确认/记忆·分工·技能只读区）、Dock 写作链（进度卡片+续跑双确认+停止校验）、
 # 保存到书籍目录对话框（写前预检+二次确认+正文待审第N章硬门+单次 save_chat_output）、待审浮条与保留/丢弃条、
 # DeepWrite 工作台、墨案主题与移动端 CSS、书源整本下载。F8 已做最小充分去重：ipc 原始通道/latestChapterOf/
 # currentState 三组逐字重复实现收敛为共享 helper；确认与校验逻辑按要求未删。本次修复净 +6 行（3196->3202）。
 crates/molan-server/src/glue.js	3210
-crates/molan-server/src/main.rs	585
+crates/molan-server/src/main.rs	417
 # F3（M2 必做，FRONTEND-AGENT-INTEGRATION §8.6/P1）：chapter_number 统一中文数字章名
 # （第十一章.md 批准后记忆/依赖/凭证可达）+ 对应回归测试；解析器保持文件名锚定不猜散文。
 crates/molan-core/src/continuity.rs	1098
-crates/molan-llm/src/lib.rs	1210
+crates/molan-llm/src/lib.rs	1186
 crates/molan-server/src/auth.rs	970
-crates/molan-server/src/handlers/stream/decompose.rs	1151
+crates/molan-server/src/handlers/stream/decompose.rs	1140
 # WAVE2（F1/F2/F4/F6 修复）：净增绝大部分为回归测试（F2/F4 6 项 + F1/F6 5 项及夹具）。
 # 抽测试到独立文件需搬动 ~920 行既有测试，diff 噪音大于收益，按本文件既有惯例登记。
 crates/molan-core/src/pipeline.rs	913
-crates/molan-server/src/handlers/stream/agent_loop.rs	1020
+crates/molan-server/src/handlers/stream/agent_loop.rs	583
 # 手动线 M2：agent_ui.js 由运行视图升级为完整创作助手（历史恢复+对账、五类工件确认卡、
 # 状态条、快捷动作、弹窗、记忆轮询）。注入脚本需单 IIFE 共享状态，拆分要改 main.rs 注入链
 # 并引入跨文件命名空间，风险大于收益；按 glue.js 既有惯例登记，后续只减不增。
