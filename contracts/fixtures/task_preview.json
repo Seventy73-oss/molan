@@ -1,0 +1,99 @@
+{
+  "context": {
+    "blockers": [
+      "第1章没有可用细纲（不存在、为空或设为 AI 不可见）：请先生成并确认细纲"
+    ],
+    "blocks": [
+      {
+        "chars": 26,
+        "hash": "<sha256>",
+        "label": "作品概况",
+        "omitted": 0,
+        "required": false,
+        "source": "book",
+        "truncated": false
+      },
+      {
+        "chars": 233,
+        "label": "长篇一致性红线",
+        "required": false,
+        "source": "auto"
+      },
+      {
+        "chars": 77,
+        "label": "待作者确认",
+        "required": false,
+        "source": "auto"
+      },
+      {
+        "chars": 30,
+        "label": "本书设定 · 系统自动注入，写作必须与以下设定保持一致",
+        "required": false,
+        "source": "auto"
+      }
+    ],
+    "ch": 1,
+    "totalChars": 367
+  },
+  "note": "预览仅供确认；执行时服务端会按同一规则重新解析并冻结本次计划。",
+  "plan": {
+    "bookId": "<id>",
+    "excluded": [
+      {
+        "code": "REPLACED",
+        "id": "bp",
+        "name": "作品主卡",
+        "reason": "作品主技能「作品主卡」本次由「本次写法」替代（只影响本次，不改作品默认）",
+        "source": "book_primary"
+      }
+    ],
+    "genre": "玄幻",
+    "humanize": {
+      "chars": 0,
+      "contentHash": "",
+      "fromOverride": false,
+      "label": "官方标准去味",
+      "method": "official:standard",
+      "note": ""
+    },
+    "humanizeOverride": null,
+    "notes": [],
+    "planHash": "<sha256>",
+    "skills": [
+      {
+        "builtinKey": "",
+        "contentHash": "",
+        "description": "",
+        "enabled": true,
+        "id": "x",
+        "kind": "user",
+        "name": "本次写法",
+        "origin": "user",
+        "rev": 1,
+        "role": "primary",
+        "source": "explicit",
+        "targets": [
+          "body"
+        ],
+        "templateChars": 2,
+        "usageMode": "standalone"
+      }
+    ],
+    "style": {
+      "chars": 0,
+      "contentHash": "",
+      "fromOverride": false,
+      "key": "",
+      "label": "作品蒸馏文风",
+      "note": "",
+      "source": "distill"
+    },
+    "styleOverride": null,
+    "task": "body",
+    "taskLabel": "正文"
+  },
+  "recommend": [],
+  "role": "chapter",
+  "task": "body",
+  "taskLabel": "正文"
+}

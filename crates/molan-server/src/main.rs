@@ -1,11 +1,12 @@
 // molan-server: 离线复刻版 Rust 后端。静态托管 + NDJSON IPC（协议与 Node 版一致）。
 mod auth;
 mod handlers;
+mod web;
 
 use axum::{
     body::Body,
     extract::{ConnectInfo, Path as AxPath, State},
-    http::{header, HeaderMap, StatusCode, Uri},
+    http::{header, HeaderMap, StatusCode},
     response::Response,
     routing::{get, post},
     Router,
@@ -31,7 +32,7 @@ pub struct AppState {
     pub secure_cookies: bool,
 }
 
-type SharedState = Arc<AppState>;
+pub(crate) type SharedState = Arc<AppState>;
 
 impl AppState {
     /// 是否启用了访问控制（配置了 MOLAN_AUTH_TOKEN）。
@@ -71,7 +72,7 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-fn plain(status: StatusCode, msg: &'static str) -> Response {
+pub(crate) fn plain(status: StatusCode, msg: &'static str) -> Response {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -89,7 +90,7 @@ fn json_response(status: StatusCode, v: serde_json::Value) -> Response {
         .unwrap()
 }
 
-fn redirect_to_login() -> Response {
+pub(crate) fn redirect_to_login() -> Response {
     Response::builder()
         .status(StatusCode::FOUND)
         .header(header::LOCATION, "/login")
@@ -160,7 +161,8 @@ async fn main() {
         tracing::info!("MOLAN_TRUSTED_SCHEME=https：会话 Cookie 将带 Secure，同源比较按 443。");
     }
 
-    let web_dir = root.join("web");
+    // 静态目录：MOLAN_WEB_DIR 优先（新前端 frontend/dist 或旧静态树回退），否则 $MOLAN_ROOT/web
+    let web_dir = web::web_dir(&root);
     let web_dir_canon = web_dir.canonicalize().unwrap_or_else(|_| web_dir.clone());
     let state: SharedState = Arc::new(AppState {
         db,
@@ -196,7 +198,7 @@ async fn main() {
         .route("/auth/login", post(login_submit))
         .route("/health", get(health))
         .route("/ipc/:cmd", post(ipc_handler))
-        .fallback(get(static_handler))
+        .fallback(get(web::static_handler))
         .with_state(state.clone());
 
     let addr = format!("{}:{}", bind, port);
@@ -411,175 +413,5 @@ async fn ipc_handler(
         .unwrap()
 }
 
-async fn static_handler(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> Response {
-    let path = percent_decode(uri.path());
-    let path = if path == "/" || path.is_empty() {
-        "/index.html".to_string()
-    } else {
-        path
-    };
-    // 启用鉴权时，静态资源（含主页）一律需要凭据；登录页/health 走各自路由，不在此处。
-    if state.auth_required() && !state.authorized(&headers) {
-        return redirect_to_login();
-    }
-    let fp = state.web_dir.join(path.trim_start_matches('/'));
-    // 统一 canonical：Windows 下 PathBuf 带 \\?\ 前缀、大小写不一致，需双方同源比较
-    // web_dir 的 canonical 由启动时缓存（state.web_dir_canon）；请求文件仍需自身 canonical 作穿越防线
-    let canonical = fp.canonicalize().unwrap_or(fp.clone());
-    if !canonical.starts_with(&state.web_dir_canon) {
-        return plain(StatusCode::FORBIDDEN, "forbidden");
-    }
-    if !canonical.is_file() {
-        return plain(StatusCode::NOT_FOUND, "not found");
-    }
-    let content = match std::fs::read(&canonical) {
-        Ok(c) => c,
-        Err(_) => return plain(StatusCode::INTERNAL_SERVER_ERROR, "read failed"),
-    };
-    let mime = match canonical.extension().and_then(|e| e.to_str()).unwrap_or("") {
-        "html" => {
-            // 注入 glue（对齐 Node 版行为）。注意：绝不注入服务器 token——
-            // 匿名可访问的 HTML 一旦内联 token 就等于公开凭据（历史缺陷 F02）。
-            let html = String::from_utf8_lossy(&content).to_string();
-            let build_ts = std::fs::metadata(&canonical)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let inject = format!(
-                "<script>window.__WX_BUILD__=\"{}\";{}</script><script>{}</script><script>{}</script>",
-                build_ts,
-                include_str!("glue.js"),
-                include_str!("pipeline_ui.js"),
-                include_str!("agent_ui.js")
-            );
-            let html = if !html.contains("__WRITERX_GLUE__") {
-                html.replacen("<head>", &format!("<head>{}", inject), 1)
-            } else {
-                html
-            };
-            return Response::builder()
-                .status(200)
-                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-                .header(
-                    header::CACHE_CONTROL,
-                    "no-store, no-cache, must-revalidate, max-age=0",
-                )
-                .header("Pragma", "no-cache")
-                .body(Body::from(html))
-                .unwrap();
-        }
-        "js" | "mjs" => "text/javascript",
-        "css" => "text/css",
-        "json" => "application/json",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "ttf" => "font/ttf",
-        "txt" => "text/plain",
-        "map" => "application/json",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "md" => "text/plain",
-        _ => "application/octet-stream",
-    };
-    // 缓存分级：/assets/ 下的字体短缓存（便于替换），其余 /assets/ 静态资源长缓存 immutable
-    let ext_lower = canonical
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let cache_control = if path.starts_with("/assets/") {
-        if matches!(ext_lower.as_str(), "woff" | "woff2" | "ttf") {
-            "public, max-age=86400"
-        } else {
-            "public, max-age=31536000, immutable"
-        }
-    } else {
-        "no-store"
-    };
-    Response::builder()
-        .status(200)
-        .header(header::CONTENT_TYPE, mime)
-        .header(header::CACHE_CONTROL, cache_control)
-        .body(Body::from(content))
-        .unwrap()
-}
-
-/// 单字节 hex 值。
-fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// 百分号解码。
-/// 必须**按字节**解析：旧实现用 &s[i+1..i+3] 做字符串切片，
-/// 当 '%' 后跟的是多字节字符（如 "/%A中"）时切点落在字符边界内会 panic。
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut bytes = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(b[i + 1]), hex_val(b[i + 2])) {
-                bytes.push((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
-        }
-        bytes.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&bytes).to_string()
-}
-
 // tokio-stream 依赖
 use futures_util::StreamExt as _;
-
-#[cfg(test)]
-mod tests {
-    use super::percent_decode;
-
-    #[test]
-    fn percent_decode_basic() {
-        assert_eq!(percent_decode("/a%20b"), "/a b");
-        assert_eq!(percent_decode("/%E4%B8%AD"), "/中");
-        assert_eq!(percent_decode("/plain"), "/plain");
-        assert_eq!(percent_decode(""), "");
-    }
-
-    #[test]
-    fn percent_decode_multibyte_after_percent_does_not_panic() {
-        // 旧实现用 &s[i+1..i+3] 字符串切片，这些输入会 panic（切点不在字符边界）。
-        assert_eq!(percent_decode("/%A中"), "/%A中");
-        assert_eq!(percent_decode("/%中"), "/%中");
-        assert_eq!(percent_decode("/%"), "/%");
-        assert_eq!(percent_decode("/%A"), "/%A");
-        assert_eq!(percent_decode("/%2"), "/%2");
-        // 无效 hex 原样保留
-        assert_eq!(percent_decode("/%zz"), "/%zz");
-        assert_eq!(percent_decode("/%2G"), "/%2G");
-    }
-
-    #[test]
-    fn percent_decode_boundary_and_truncation() {
-        // '%' 恰在末尾
-        assert_eq!(percent_decode("abc%"), "abc%");
-        // 有效编码后紧跟多字节
-        assert_eq!(percent_decode("/%2F中"), "//中");
-        // 非 UTF-8 结果按 lossy 处理，不应 panic
-        assert_eq!(percent_decode("/%FF"), "/�");
-    }
-}

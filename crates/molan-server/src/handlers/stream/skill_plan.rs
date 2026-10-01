@@ -14,9 +14,7 @@ use molan_core::db::Db;
 use serde_json::{json, Value};
 
 /// 已知任务名（与 agent_tools::SKILL_TASKS / effective_skills 路由一致）。
-pub(crate) const SKILL_TASKS: [&str; 9] = [
-    "chat", "plot", "outline", "body", "revise", "review", "humanize", "summary", "distill",
-];
+pub(crate) const SKILL_TASKS: [&str; 9] = molan_core::task_kind::IDS;
 
 pub(crate) fn valid_task(task: &str) -> bool {
     SKILL_TASKS.contains(&task)

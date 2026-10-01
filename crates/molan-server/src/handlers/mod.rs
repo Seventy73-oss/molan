@@ -6,6 +6,7 @@ use molan_core::files;
 
 pub mod exports;
 mod saved_output;
+mod v2;
 use molan_core::stats;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -50,6 +51,10 @@ pub async fn dispatch(
     // 可选 bookId（空=全书范围，用于导出）；避免各臂重复 6 行样板
     let opt_book = |k: &str| Some(s(k)).filter(|b| !b.is_empty());
 
+    // Paper Studio 新增命令（全部为加法；旧命令语义不变）
+    if let Some(out) = v2::dispatch(st, cmd, args, tx).await {
+        return out;
+    }
     // ---------- 技能 ----------
     match cmd {
         "list_skills" => {
@@ -156,8 +161,11 @@ pub async fn dispatch(
                     let sql = format!("UPDATE skills SET {} WHERE id=?", sets.join(","));
                     let refs: Vec<&dyn rusqlite::ToSql> = vals.iter().map(|b| b.as_ref()).collect();
                     db.exec(&sql, &refs)?;
-                    // 只有模板真的被改才自增版本（改名/改描述不应伪造新版本）
-                    if args.get("promptTemplate").is_some() {
+                    // 影响注入结果的字段（模板/适用任务/使用方式/类型）变化才自增版本；改名/改描述不伪造新版本
+                    if ["promptTemplate", "targets", "usageMode", "kind"]
+                        .iter()
+                        .any(|k| args.get(*k).is_some())
+                    {
                         molan_core::skill_rev::bump_revision(db, &id, "update_skill")?;
                     }
                 }
@@ -212,6 +220,13 @@ pub async fn dispatch(
                 let sql = format!("UPDATE skills SET {} WHERE id=?", sets.join(","));
                 let refs: Vec<&dyn rusqlite::ToSql> = vals.iter().map(|b| b.as_ref()).collect();
                 db.exec(&sql, &refs)?;
+                let r = a("ref");
+                if ["promptTemplate", "kind", "usageMode"]
+                    .iter()
+                    .any(|k| r.get(*k).or_else(|| args.get(*k)).is_some())
+                {
+                    molan_core::skill_rev::bump_revision(db, &id, "write_skill_ref")?;
+                }
             }
             Ok(Some(skill_mapped(db, &id)))
         }
@@ -226,31 +241,9 @@ pub async fn dispatch(
             Ok(Some(out))
         }
         "draft_skill" => {
-            // 技能工坊「帮我起草」：真实 LLM 生成技能模板（对齐 node draftSkill）
-            let chn =
-                molan_llm::active_channel(db).ok_or_else(|| anyhow!("未配置可用的模型渠道"))?;
-            let p = read_prompts(&st.root);
-            let user = format!(
-                "{}\n用法场景：{}\n任务：{}\n技能名：{}\n描述：{}",
-                p["skill_draft"].as_str().unwrap_or(""),
-                s("usage"),
-                s("task"),
-                s("name"),
-                s("description"),
-            );
-            let out = molan_llm::chat_once(molan_llm::ChatParams {
-                base_url: chn["baseUrl"].as_str().unwrap_or("").to_string(),
-                api_key: chn["key"].as_str().unwrap_or("").to_string(),
-                model: chn["model"].as_str().unwrap_or("deepseek-chat").to_string(),
-                messages: vec![
-                    json!({"role": "system", "content": "你是写作技能工程师，产出可直接用于 AI 写作技能的 prompt 模板。"}),
-                    json!({"role": "user", "content": user}),
-                ],
-                max_tokens: 4000,
-                ..Default::default()
-            })
-            .await?;
-            Ok(Some(json!({"draft": out.trim().to_string()})))
+            // 技能工坊「帮我起草」（旧形状 {draft}）：与草稿产物共用同一生成实现
+            let out = v2::skill_draft::generate(st, args).await?;
+            Ok(Some(json!({"draft": out})))
         }
         "set_skill_script_authorization2" => Ok(Some(json!({"ok": true, "text": ""}))),
         "test_run_skill_script" | "test_run_draft_script" => {
@@ -622,12 +615,10 @@ pub async fn dispatch(
                 let ch = r["ch"].as_i64().unwrap_or(0);
                 let content = files::read_file(db, &book_id, molan_core::db::REVIEW_GROUP, &name)
                     .unwrap_or_default();
-                let mut outline = String::new();
-                if let Some(o) =
+                let outline: String =
                     files::read_file(db, &book_id, "细纲", &format!("细纲_第{}章.md", ch))
-                {
-                    outline = o.chars().take(200).collect();
-                }
+                        .map(|o| o.chars().take(200).collect())
+                        .unwrap_or_default();
                 // 依赖账本状态（null=未登记）：stale 表示父稿已变，批准前必须重审
                 let dep: Option<String> = db
                     .q_json(
@@ -649,6 +640,7 @@ pub async fn dispatch(
                     "outline": outline,
                     "dependencyStatus": dep,
                     "deai": molan_core::deai::score_text(&content)["score"],
+                    "review": molan_core::review_log::latest(db, &book_id, ch, &molan_core::continuity::content_hash(&content)),
                 }));
             }
             Ok(Some(json!(out)))
@@ -660,134 +652,51 @@ pub async fn dispatch(
             Ok(Some(json!(content)))
         }
         "approve_chapter" => {
-            // 审批唯一入口：core::approve_pending_chapter（依赖检查 + 非覆盖 + 先落盘后删待审）
+            // 审批唯一入口：core::chapter_commit::approve（重入核对 + saga + 可选审阅版本绑定）
             let book_id = s("bookId");
-            let name = {
-                let n = s("name");
-                if !n.is_empty() {
-                    n
-                } else {
-                    // 兼容只传 ch 的调用方：从队列反查文件名
-                    let ch = a("ch").as_i64().unwrap_or(0);
-                    db.q_json(
-                        "SELECT review_file FROM pending_chapter WHERE book_id=?1 AND ch=?2 AND status='pending'",
-                        &[
-                            &book_id as &dyn rusqlite::ToSql,
-                            &ch as &dyn rusqlite::ToSql,
-                        ],
-                    )
-                    .ok()
-                    .and_then(|v| {
-                        v.first()
-                            .and_then(|r| r["reviewFile"].as_str().map(|x| x.to_string()))
-                    })
-                    .unwrap_or_default()
-                }
-            };
-            if book_id.is_empty() || name.is_empty() {
-                return Err(anyhow!("缺少 bookId/name"));
+            let expected = s("expectedHash");
+            let t0 = std::time::Instant::now();
+            let r = molan_core::chapter_commit::approve(
+                db,
+                &book_id,
+                &s("name"),
+                a("ch").as_i64().unwrap_or(0),
+                Some(expected.as_str()).filter(|e| !e.is_empty()),
+                "manual_approve",
+            )?;
+            if r["alreadyApproved"] == json!(true) {
+                return Ok(Some(r));
             }
-            // 重入判定：不能只看"文件在不在"。
-            // 需要 pending_chapter 为 approved **且** file_revision 记录的正式稿 hash
-            // 与当前磁盘正式稿 hash 一致，才算真正幂等已批准。
-            // 旧库没有 hash 记录时明确提示"需人工确认"，绝不假装相等。
-            let row = db
-                .q_json(
-                    "SELECT status FROM pending_chapter WHERE book_id=?1 AND review_file=?2",
-                    &[
-                        &book_id as &dyn rusqlite::ToSql,
-                        &name as &dyn rusqlite::ToSql,
-                    ],
-                )
-                .unwrap_or_default();
-            let approved_status =
-                row.first().and_then(|r| r["status"].as_str()) == Some("approved");
-            if approved_status {
-                let formal = files::book_path(db, &book_id, "正文", &name);
-                let disk = std::fs::read_to_string(&formal).ok();
-                // 批准回执取自 immutable 的 chapter_approved 事件（父 continuity）。
-                // 不能用 file_revision：它记录的是"最近一次作者改写"，永远等于最新稿，无法证明当初批的是哪一版。
-                let receipt =
-                    molan_core::continuity::approved_hash(db, &book_id, &name).unwrap_or(None);
-                match (disk.as_deref(), receipt.as_deref()) {
-                    (Some(d), Some(rec)) if molan_core::continuity::content_hash(d) == rec => {
-                        return Ok(Some(json!({
-                            "ok": true, "finalName": name, "alreadyApproved": true,
-                            "verified": "approved-receipt-hash-match",
-                        })));
-                    }
-                    (Some(_), Some(_)) => {
-                        return Err(anyhow!(
-                            "该章已批准，但当前正式稿与批准回执的指纹不一致（批准后被改动过）。请人工确认后再处理，系统不会静默重复接受。"
-                        ));
-                    }
-                    (Some(_), None) => {
-                        // 旧库无批准回执：不假称已验
-                        return Ok(Some(json!({
-                            "ok": true, "finalName": name, "alreadyApproved": true,
-                            "verified": "unverified",
-                            "warning": "该章已标记批准，但缺少批准回执（历史数据），无法核对批准后是否被改动，请人工确认。",
-                        })));
-                    }
-                    (None, _) => {
-                        return Err(anyhow!(
-                            "队列显示该章已批准，但正式稿文件不存在：{}。请检查磁盘或重新生成。",
-                            name
-                        ));
-                    }
-                }
-            }
-            let final_name = files::approve_pending_chapter(db, &book_id, &name)?;
-            stats::refresh_words(db, &book_id);
-            tracing::info!("审批通过：{} → 正文/{}", name, final_name);
-            // 章后处理：以"刚批准的章"为对象（不再取全书最大章）。失败不抹掉已提交成果。
-            let ch = chapter_num_from_name(&final_name).unwrap_or(0);
-            // 章节状态机（P0-2）：人工批准入账（只观测不阻断）
-            if ch > 0 {
-                let _ = molan_core::chapter_state::record_approved(
-                    db,
-                    &book_id,
-                    ch,
-                    json!({"finalName": final_name, "by": "manual_approve"}),
-                );
-            }
+            let ch = r["ch"].as_i64().unwrap_or(0);
+            let ms = t0.elapsed().as_millis();
+            tracing::info!(
+                "审批通过：→ 正文/{}（服务端 {}ms）",
+                r["finalName"].as_str().unwrap_or(""),
+                ms
+            );
             let post = if ch > 0 {
-                spawn_post_approved(Arc::clone(st), &book_id, ch);
+                spawn_post_approved(Arc::clone(st), &book_id, vec![ch]);
                 "queued"
             } else {
                 "skipped（无法从文件名解析章号）"
             };
             Ok(Some(json!({
-                "ok": true, "finalName": final_name, "postProcess": post,
+                "ok": true, "finalName": r["finalName"], "hash": r["hash"], "postProcess": post, "writeId": r["writeId"],
                 "postProcessNote": "章后处理异步执行；若失败，定稿仍保留，失败原因可通过 memory_status 查询并重跑。",
             })))
         }
         "reject_chapter" => {
-            let book_id = s("bookId");
-            let ch = a("ch").as_i64().unwrap_or(0);
-            let name = s("name");
             // 拒绝 = 待审稿安全进回收站（可恢复）；回收失败必须报错，不能假装拒绝成功
-            files::delete_file(db, &book_id, molan_core::db::REVIEW_GROUP, &name)?;
-            let updated = db
-                .exec(
-                    "UPDATE pending_chapter SET status='rejected', updated_at=?2 WHERE book_id=?1 AND (ch=?3 OR review_file=?4)",
-                    &[
-                        &book_id as &dyn rusqlite::ToSql,
-                        &stats::now_ms(),
-                        &ch,
-                        &name as &dyn rusqlite::ToSql,
-                    ],
-                )
-                .unwrap_or(0);
-            if updated == 0 {
-                tracing::warn!(
-                    "reject_chapter：未找到待审记录（book={} ch={} name={}）",
-                    &book_id,
-                    ch,
-                    &name
-                );
+            let r = molan_core::chapter_commit::reject(
+                db,
+                &s("bookId"),
+                a("ch").as_i64().unwrap_or(0),
+                &s("name"),
+            )?;
+            if r["queueUpdated"] != json!(true) {
+                tracing::warn!("reject_chapter：未找到待审记录（name={}）", s("name"));
             }
-            Ok(Some(json!({"ok": true})))
+            Ok(Some(r))
         }
         "approve_all_pending" => {
             let book_id = s("bookId");
@@ -798,6 +707,7 @@ pub async fn dispatch(
                 )
                 .unwrap_or_default();
             let mut approved: Vec<i64> = Vec::new();
+            let mut post_chs: Vec<i64> = Vec::new();
             let mut failures: Vec<Value> = Vec::new();
             for r in rows {
                 let ch = r["ch"].as_i64().unwrap_or(0);
@@ -805,19 +715,18 @@ pub async fn dispatch(
                 if name.is_empty() {
                     continue;
                 }
-                match files::approve_pending_chapter(db, &book_id, &name) {
-                    Ok(final_name) => {
+                match molan_core::chapter_commit::approve(
+                    db,
+                    &book_id,
+                    &name,
+                    ch,
+                    None,
+                    "manual_approve_all",
+                ) {
+                    Ok(r) => {
                         approved.push(ch);
-                        let real_ch = chapter_num_from_name(&final_name).unwrap_or(ch);
-                        if real_ch > 0 {
-                            // G6：批量与单章审批路径状态机记账对等（只观测不阻断）
-                            let _ = molan_core::chapter_state::record_approved(
-                                db,
-                                &book_id,
-                                real_ch,
-                                json!({"finalName": final_name, "by": "manual_approve_all"}),
-                            );
-                            spawn_post_approved(Arc::clone(st), &book_id, real_ch);
+                        if let Some(real_ch) = r["ch"].as_i64().filter(|c| *c > 0) {
+                            post_chs.push(real_ch);
                         }
                     }
                     // 单章失败不中断其余：逐条返回原因（冲突/依赖失效/IO 错误）
@@ -826,9 +735,8 @@ pub async fn dispatch(
                     }
                 }
             }
-            if !approved.is_empty() {
-                stats::refresh_words(db, &book_id);
-            }
+            // 记忆按章序串行同步：并行抽取会让后章因前章记忆未就绪而校验失败
+            spawn_post_approved(Arc::clone(st), &book_id, post_chs);
             Ok(Some(json!({
                 "ok": failures.is_empty(),
                 "approved": approved.len(),
@@ -863,8 +771,9 @@ pub async fn dispatch(
                 if !rows.is_empty() {
                     return Err(anyhow!("该章已有待审稿，请先处理审批队列"));
                 }
-                files::write_ai_file(db, &book_id, &group, &name, &content)?;
-                let queued = register_review_queue(db, &book_id, &name, &content)?;
+                let queued = molan_core::chapter_commit::write_review_and_register(
+                    db, &book_id, &name, &content, true,
+                )?;
                 return Ok(Some(
                     json!({"ok": true, "group": group, "name": name, "pending": queued}),
                 ));
@@ -884,16 +793,14 @@ pub async fn dispatch(
             }
             let book_id = s("bookId");
             let content = s("content");
-            files::write_file(db, &book_id, &group, &name, &content)?;
-            // 作者手动把稿子放进「正文待审」时，必须同步登记审批队列，
-            // 否则 approve 会因查不到队列记录而失败（正文已落盘却报错，用户卡在双稿状态）。
-            // 规则（按章 upsert，且**内容感知**）：
-            // - 保持 approved 仅当"队列已批准"且"本次写入内容 == 批准回执 hash"（同一份稿重复保存）；
-            // - 否则一律回到 pending —— 作者改了稿、或这是同章的新草稿，都必须重新走审批，
-            //   绝不能因为"该章历史上批准过"就让新内容继承 approved（否则新稿永远批不了）。
+            // 作者手动放进「正文待审」：写盘与登记同锁完成（chapter_commit），按章 upsert 且内容感知——
+            // 仅「已批准且内容 == 批准回执 hash」保持 approved，否则回到 pending 重新审批。
             let queued = if files::normalize_group(&group) == molan_core::db::REVIEW_GROUP {
-                register_review_queue(db, &book_id, &name, &content)?
+                molan_core::chapter_commit::write_review_and_register(
+                    db, &book_id, &name, &content, false,
+                )?
             } else {
+                files::write_file(db, &book_id, &group, &name, &content)?;
                 Value::Null
             };
             Ok(Some(json!({"ok": true, "group": group, "pending": queued})))
@@ -930,8 +837,9 @@ pub async fn dispatch(
                 })
                 .ok_or_else(|| anyhow!("产出无「# 第N章」标题且未指明章号，无法定章存入待审"))?;
             let name = format!("第{}章.md", ch);
-            files::write_file(db, &book_id, molan_core::db::REVIEW_GROUP, &name, &content)?;
-            let queued = register_review_queue(db, &book_id, &name, &content)?;
+            let queued = molan_core::chapter_commit::write_review_and_register(
+                db, &book_id, &name, &content, false,
+            )?;
             Ok(Some(
                 json!({"ok": true, "ch": ch, "name": name, "pending": queued}),
             ))
@@ -941,7 +849,10 @@ pub async fn dispatch(
             let book_id = s("bookId");
             let t = s("targetName");
             let content = s("content");
-            if !book_id.is_empty() && !t.is_empty() && !content.is_empty() {
+            if book_id.is_empty() || t.is_empty() || content.is_empty() {
+                return Err(anyhow!("缺少 bookId/targetName/content，未写入任何内容"));
+            }
+            {
                 let tree = files::scan_tree(db, &book_id);
                 let order = |d: &str| match d {
                     "正文" => 0,
@@ -973,6 +884,15 @@ pub async fn dispatch(
                     }
                 }
                 let group = best.unwrap_or_else(|| "设定".to_string());
+                if group == "正文" {
+                    return Err(anyhow!(
+                        "目标「{}」是正式正文：正文修改必须走待审→定稿，或在编辑器中由作者修改；未写入",
+                        t
+                    ));
+                }
+                if files::file_flag(db, &book_id, &group, &t, "locked") {
+                    return Err(anyhow!("{}/{} 已被作者锁定，AI 结果不能写入", group, t));
+                }
                 files::write_file(db, &book_id, &group, &t, &content)?;
             }
             let out = json!({
@@ -1759,14 +1679,13 @@ pub async fn dispatch(
             );
             if !book_id.is_empty() {
                 // 场景拼稿是 AI 会话产出，只能新建进正文待审，绝不直写正式正文。
-                files::write_ai_file(
+                molan_core::chapter_commit::write_review_and_register(
                     db,
                     &book_id,
-                    molan_core::db::REVIEW_GROUP,
                     &fname,
                     body.trim(),
+                    true,
                 )?;
-                let _ = register_review_queue(db, &book_id, &fname, body.trim());
                 let _ = db.exec(
                     "UPDATE messages SET content=?, updated_at=? WHERE id=?",
                     &[
@@ -1841,9 +1760,9 @@ pub async fn dispatch(
                 .unwrap_or_default();
             // 主/辅助技能是核心输入（effective_skills 依赖）。core 这两个函数内部不取 fs_lock，
             // 父授权由 handler 局部包裹（纯同步、无 await，不会与 core 自身加锁的函数互相递归）。
+            let task = binding_task(db, &s("bookId"), &s("taskKind"), &ids)?;
             let _g = db.fs_lock.lock().unwrap_or_else(|e| e.into_inner());
-            let out =
-                molan_core::books::set_book_support_skills(db, &s("bookId"), &s("taskKind"), &ids);
+            let out = molan_core::books::set_book_support_skills(db, &s("bookId"), &task, &ids);
             drop(_g);
             Ok(Some(out))
         }
@@ -2108,13 +2027,14 @@ pub async fn dispatch(
             )))
         }
         "set_book_primary_skill" => {
+            let sid = s("skillId");
+            let ids: Vec<String> = Some(sid.clone())
+                .filter(|x| !x.is_empty())
+                .into_iter()
+                .collect();
+            let task = binding_task(db, &s("bookId"), &s("taskKind"), &ids)?;
             let _g = db.fs_lock.lock().unwrap_or_else(|e| e.into_inner());
-            let out = molan_core::books::set_book_primary_skill(
-                db,
-                &s("bookId"),
-                &s("taskKind"),
-                &s("skillId"),
-            );
+            let out = molan_core::books::set_book_primary_skill(db, &s("bookId"), &task, &sid);
             drop(_g);
             Ok(Some(out))
         }
@@ -2506,12 +2426,14 @@ fn mark_post_process_failed(
 /// 审批成功后的章后处理（人物表/伏笔/摘要/记忆）。
 /// 关键语义：提交已成功 → 后处理失败**只标记、可重试**，绝不回滚或抹掉已提交的正式稿。
 /// 调用 B 的 post_approved_chapter：只处理传入的"刚批准章"，不再用全书最大章替代。
-fn spawn_post_approved(st: Arc<AppState>, book_id: &str, ch: i64) {
+pub(crate) fn spawn_post_approved(st: Arc<AppState>, book_id: &str, chs: Vec<i64>) {
     let book = book_id.to_string();
-    let name = format!("第{}章.md", ch);
     tokio::spawn(async move {
-        if let Err(e) = stream::post_approved_chapter(&st, &book, ch).await {
-            mark_post_process_failed(&st.db, &book, ch, &name, &e.to_string());
+        for ch in chs {
+            if let Err(e) = stream::post_approved_chapter(&st, &book, ch).await {
+                let name = format!("第{}章.md", ch);
+                mark_post_process_failed(&st.db, &book, ch, &name, &e.to_string());
+            }
         }
     });
 }
@@ -2564,6 +2486,21 @@ fn sessions_owned(db: &molan_core::db::Db, session_id: &str, book_id: &str) -> R
     Ok(())
 }
 
+/// 作品技能绑定参数校验：书有效、任务名可解析（返回规范 ID，如 chapter→body）、技能存在。
+fn binding_task(db: &molan_core::db::Db, book: &str, task: &str, ids: &[String]) -> Result<String> {
+    if !files::valid_book_id(db, book) {
+        return Err(anyhow!("作品不存在或已删除"));
+    }
+    let kind = molan_core::task_kind::TaskKind::parse(task)
+        .ok_or_else(|| anyhow!("未知任务类型「{}」", task))?;
+    for id in ids {
+        if skill_by_id(db, id).is_none() {
+            return Err(anyhow!("技能不存在：{}", id));
+        }
+    }
+    Ok(kind.id().to_string())
+}
+
 pub fn skill_row(r: &Value) -> Value {
     // q_json 已把列名转 camel：builtin_key->builtinKey 等
     json!({
@@ -2578,6 +2515,7 @@ pub fn skill_row(r: &Value) -> Value {
         "promptTemplate": r["promptTemplate"].as_str().unwrap_or(""),
         "targets": serde_json::from_str::<Value>(r["targetsJson"].as_str().unwrap_or("[]")).unwrap_or(json!([])),
         "capabilities": r["capabilitiesJson"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        "rev": r["rev"].as_i64().unwrap_or(1), "contentHash": r["contentHash"].as_str().unwrap_or(""),
     })
 }
 
@@ -2783,77 +2721,8 @@ fn plugin_stub(name: &str, _args: &Value) -> Value {
         _ => Value::Null,
     }
 }
-// 写作引擎辅助：中文/阿拉伯章节数字解析（对齐 Node zhNum）
-fn zh_num(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    if s.chars().all(|c| c.is_ascii_digit()) {
-        return s.parse::<i64>().ok();
-    }
-    let map = [
-        ('零', 0),
-        ('一', 1),
-        ('二', 2),
-        ('两', 2),
-        ('三', 3),
-        ('四', 4),
-        ('五', 5),
-        ('六', 6),
-        ('七', 7),
-        ('八', 8),
-        ('九', 9),
-        ('十', 10),
-        ('百', 100),
-        ('千', 1000),
-    ];
-    let mut r = 0i64;
-    let mut cur = 0i64;
-    for ch in s.chars() {
-        let v = map.iter().find(|(c, _)| *c == ch).map(|(_, v)| *v)?;
-        if v >= 10 {
-            r += (if cur == 0 { 1 } else { cur }) * v;
-            cur = 0;
-        } else {
-            cur = v;
-        }
-    }
-    Some(r + cur)
-}
-
-// 「第X章」文件名 → X（不依赖正则）
-pub fn chapter_num_from_name(name: &str) -> Option<i64> {
-    let chars: Vec<char> = name.chars().collect();
-    let mut i = 0;
-    while i < chars.len() && chars[i] != '第' {
-        i += 1;
-    }
-    if i >= chars.len() {
-        return None;
-    }
-    i += 1;
-    let mut num_txt = String::new();
-    while i < chars.len() {
-        let ch = chars[i];
-        if ch == '章' {
-            break;
-        }
-        if ch.is_whitespace() {
-            if num_txt.is_empty() {
-                i += 1;
-                continue;
-            }
-            break;
-        }
-        num_txt.push(ch);
-        i += 1;
-    }
-    if num_txt.is_empty() {
-        return None;
-    }
-    zh_num(&num_txt)
-}
+// 章号解析与待审登记的唯一实现在 molan_core::chapter_commit（此处保留旧路径名供既有调用点使用）
+pub use molan_core::chapter_commit::chapter_num_from_name;
 
 /// 写入「正文待审」后登记审批队列（write_file 与 save_partial_as_review 共用）：
 /// 保持 approved 仅当「队列已批准 且 本次内容 == 批准回执 hash」（同一份稿重复保存）；
@@ -2865,57 +2734,7 @@ pub(crate) fn register_review_queue(
     name: &str,
     content: &str,
 ) -> anyhow::Result<Value> {
-    let now = stats::now_ms();
-    let _g = db.fs_lock.lock().unwrap_or_else(|e| e.into_inner());
-    // Non-chapter prose keeps its filename; negative queue IDs never collide with chapters.
-    let ch = match chapter_num_from_name(name) {
-        Some(ch) if ch > 0 => ch,
-        _ => {
-            let existing = db.q_json(
-                "SELECT ch FROM pending_chapter WHERE book_id=?1 AND review_file=?2",
-                &[&book_id as &dyn rusqlite::ToSql, &name],
-            )?;
-            if let Some(ch) = existing.first().and_then(|r| r["ch"].as_i64()) {
-                ch
-            } else {
-                let rows = db.q_json(
-                    "SELECT MIN(ch) AS low FROM pending_chapter WHERE book_id=?1",
-                    &[&book_id],
-                )?;
-                rows.first()
-                    .and_then(|r| r["low"].as_i64())
-                    .unwrap_or(0)
-                    .min(0)
-                    .checked_sub(1)
-                    .ok_or_else(|| anyhow!("待审编号已耗尽"))?
-            }
-        }
-    };
-    let prev = db
-        .q_json(
-            "SELECT status FROM pending_chapter WHERE book_id=?1 AND ch=?2",
-            &[&book_id as &dyn rusqlite::ToSql, &ch],
-        )
-        .unwrap_or_default();
-    let prev_approved = prev.first().and_then(|r| r["status"].as_str()) == Some("approved");
-    let receipt = molan_core::continuity::approved_hash(db, book_id, name).unwrap_or(None);
-    let same_as_approved = match receipt.as_deref() {
-        Some(rec) => molan_core::continuity::content_hash(content) == rec,
-        None => false,
-    };
-    let keep_approved = prev_approved && same_as_approved;
-    let status = if keep_approved { "approved" } else { "pending" };
-    db.exec(
-        "INSERT INTO pending_chapter(book_id,ch,review_file,status,created_at,updated_at)
-         VALUES(?1,?2,?3,?4,?5,?5)
-         ON CONFLICT(book_id,ch) DO UPDATE SET
-             review_file=excluded.review_file,
-             status=excluded.status,
-             updated_at=excluded.updated_at",
-        &[&book_id as &dyn rusqlite::ToSql, &ch, &name, &status, &now],
-    )?;
-    drop(_g);
-    Ok(json!({ "ch": ch, "status": status }))
+    molan_core::chapter_commit::register_pending(db, book_id, name, content)
 }
 
 fn max_chapter_num(tree: &Value, group_dir: &str) -> i64 {

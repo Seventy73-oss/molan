@@ -1,0 +1,22 @@
+{
+  "actor": "user",
+  "afterHash": "<sha256>",
+  "beforeHash": null,
+  "bookId": "<id>",
+  "chars": 3,
+  "commit": "committed",
+  "durationMs": 0,
+  "error": null,
+  "group": "设定",
+  "idempotencyKey": "k1",
+  "index": "ok",
+  "indexError": null,
+  "name": "人物.md",
+  "op": "create",
+  "recovered": false,
+  "replayed": false,
+  "revision": 1,
+  "source": null,
+  "ts": 0,
+  "writeId": "<id>"
+}

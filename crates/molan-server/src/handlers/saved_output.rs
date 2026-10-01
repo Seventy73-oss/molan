@@ -105,9 +105,16 @@ pub(super) fn save(db: &molan_core::db::Db, args: &Value) -> Result<Value> {
             None if receipts.contains(&receipt) => {
                 bail!("已保存文件被移除，请检查目录；不会自动重建")
             }
+            // 待审稿：写盘与登记同锁完成，不留孤儿稿
+            None if group == molan_core::db::REVIEW_GROUP => {
+                molan_core::chapter_commit::write_review_and_register(
+                    db, &book, &name, content, true,
+                )?;
+            }
             None => files::write_ai_file(db, &book, &group, &name, content)?,
         }
         if group == molan_core::db::REVIEW_GROUP {
+            // 幂等重放（文件已是同内容）时补登，已登记则为无变化 upsert
             super::register_review_queue(db, &book, &name, content)?;
         }
         if !receipts.contains(&receipt) {

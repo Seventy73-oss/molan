@@ -1,0 +1,149 @@
+{
+  "artifact": {
+    "actions": [
+      {
+        "id": "draft_body",
+        "label": "起草本章正文",
+        "primary": true
+      },
+      {
+        "id": "open_file",
+        "label": "打开细纲",
+        "primary": false
+      },
+      {
+        "id": "edit",
+        "label": "编辑后保存为新修订",
+        "primary": false
+      },
+      {
+        "id": "copy",
+        "label": "复制全文",
+        "primary": false
+      }
+    ],
+    "bookId": "<id>",
+    "chars": 13,
+    "content": "# 第1章细纲\n冲突与钩子",
+    "contentHash": "<sha256>",
+    "createdAt": 0,
+    "deliveries": [
+      {
+        "action": "save",
+        "afterHash": "<sha256>",
+        "ch": 1,
+        "createdAt": 0,
+        "detail": {
+          "actor": "ai",
+          "afterHash": "<sha256>",
+          "beforeHash": null,
+          "bookId": "<id>",
+          "chars": 13,
+          "commit": "committed",
+          "error": null,
+          "group": "细纲",
+          "idempotencyKey": "artifact:<uuid>:s1",
+          "index": "ok",
+          "indexError": null,
+          "name": "细纲_第1章.md",
+          "op": "create",
+          "recovered": false,
+          "replayed": false,
+          "revision": 1,
+          "source": {
+            "artifactId": "<id>",
+            "item": 0,
+            "rev": 1
+          },
+          "ts": 0,
+          "writeId": "<id>"
+        },
+        "group": "细纲",
+        "id": "<id>",
+        "item": 0,
+        "name": "细纲_第1章.md",
+        "op": "create",
+        "rev": 1,
+        "status": "committed",
+        "writeId": "<id>"
+      },
+      {
+        "action": "confirm_outline",
+        "afterHash": "<sha256>",
+        "ch": 1,
+        "createdAt": 0,
+        "detail": {
+          "ch": 1,
+          "confirmedAt": 0,
+          "hash": "<sha256>",
+          "name": "细纲_第1章.md",
+          "ok": true
+        },
+        "group": "细纲",
+        "id": "<id>",
+        "item": 0,
+        "name": "细纲_第1章.md",
+        "op": "",
+        "rev": 1,
+        "status": "committed",
+        "writeId": ""
+      }
+    ],
+    "format": "markdown",
+    "id": "<id>",
+    "item": {
+      "chars": 13,
+      "content": null,
+      "group": null,
+      "hash": "<sha256>",
+      "index": 0,
+      "location": {
+        "ch": 1,
+        "group": "细纲",
+        "name": "细纲_第1章.md"
+      },
+      "name": null,
+      "note": "细纲/细纲_第1章.md 已确认，可起草第1章正文",
+      "state": "confirmed",
+      "stateLabel": "细纲已确认",
+      "title": "第1章细纲"
+    },
+    "items": [],
+    "kind": "outline_draft",
+    "kindLabel": "细纲草稿",
+    "legacy": false,
+    "lifecycle": "generated",
+    "messageId": "",
+    "origin": "model",
+    "provenance": null,
+    "rev": 1,
+    "runId": "",
+    "scope": "document",
+    "sessionId": "S",
+    "state": "confirmed",
+    "stateLabel": "细纲已确认",
+    "summary": "细纲/细纲_第1章.md 已确认，可起草第1章正文",
+    "target": {
+      "ch": 1
+    },
+    "task": "outline",
+    "taskLabel": "细纲",
+    "title": "第1章细纲",
+    "truncated": false,
+    "updatedAt": 0
+  },
+  "delivery": {
+    "action": "confirm_outline",
+    "deliveryId": "<id>",
+    "ok": true,
+    "result": {
+      "ch": 1,
+      "confirmedAt": 0,
+      "hash": "<sha256>",
+      "name": "细纲_第1章.md",
+      "ok": true
+    },
+    "status": "committed"
+  },
+  "ms": 0
+}

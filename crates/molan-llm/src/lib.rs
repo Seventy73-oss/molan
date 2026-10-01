@@ -1,5 +1,6 @@
 // molan-llm: 渠道管理 + OpenAI 兼容流式客户端（对齐 lib/llm.js）
 pub mod agent_transport;
+mod mock;
 pub mod retry;
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
@@ -595,32 +596,7 @@ pub async fn chat_completion_stream_opts(
             let _ = tx.send(LlmEvent::Meta(None));
             return Ok(CompletionState::ToolCalls);
         }
-        let body = if sys.contains("审读一章正文") {
-            // 审核员（system 首句唯一标识；其 ok/issues 指令在 user 消息里）：
-            // 返回「通过」的合法审核 JSON——此前审核永远解析失败→fail-closed 全转待审，
-            // mock 下永远走不到「审核通过→直接写正文」快路径
-            "{\"ok\":true,\"issues\":[],\"fix\":\"\"}".to_string()
-        } else if sys.contains("输出人物状态变更 JSON")
-            || sys.contains("只输出 JSON")
-            || sys.contains("只输出JSON")
-        {
-            "{\"updates\":[],\"newCharacters\":[]}".to_string()
-        } else if sys.contains("压缩成「前情摘要」") {
-            "（覆盖至第N章）主角获得入门名额，结识神秘老者，玉佩伏笔已埋（第1章）。".to_string()
-        } else if sys.contains("走向级细纲") {
-            "# 第1章 细纲\n\n**本章目标**：主角登场，埋下身世伏笔。\n**冲突与对手**：与同门争夺入门名额。\n**看点与爽点**：主角逆袭拿到名额。\n**章末钩子**：神秘老者递来半块玉佩。".to_string()
-        } else {
-            // 正文：凑够 600+ 字避免被「正文过短」校验拦截
-            let mut t = String::from("第一章 初入山门\n\n山风掠过石阶，少年背着一个旧行囊，站在了青岚宗的山门前。他抬头望着云雾深处的连绵殿宇，攥紧了手里的荐书。");
-            for i in 0..8 {
-                t.push_str(&format!(
-                    "\n\n这段路他走得并不轻松。第{}次停下歇脚的时候，他想起临行前村里的老人说过的话：修行一途，如逆水行舟，不进则退。少年咬了咬牙，继续向上走去。石阶尽头，一名灰袍弟子拦住了他，问他可有名录在册。少年递上荐书，对方翻看片刻，露出一丝讶异的神色，随即领着他往偏殿走去。",
-                    i + 1
-                ));
-            }
-            t.push_str("\n\n偏殿之中，一位白发长老睁开双眼，目光如电，上下打量着这个风尘仆仆的少年。「倒是块好料子。」长老淡淡说道，「不过，我青岚宗收徒，向来只看根骨与心性。你可敢接下三试？」少年挺直脊背，朗声答道：「敢。」");
-            t
-        };
+        let body = mock::mock_body(sys, user);
         let _ = tx.send(LlmEvent::Delta(body));
         let _ = tx.send(LlmEvent::Meta(None));
         return Ok(CompletionState::Done);

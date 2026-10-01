@@ -61,7 +61,13 @@ pub(crate) fn append_target_outline(
     let name = target_outline_name(db, book_id, target_ch)?;
     // 去重按「注入标记」而非文件名子串（§7 稳定引用）：作者正文里提到文件名不算已注入
     let marker = format!("【本章细纲·第{}章·{}", target_ch, name);
-    if context.contains(&marker) || files::file_flag(db, book_id, "细纲", &name, "aiOff") {
+    // auto_book_context 注入「细纲_第N章.md」时用的是另一种标题格式；两种都认，避免同一细纲注入两遍
+    let auto_injected = name == format!("细纲_第{}章.md", target_ch)
+        && context.contains(&format!("【本章细纲·第{}章（", target_ch));
+    if context.contains(&marker)
+        || auto_injected
+        || files::file_flag(db, book_id, "细纲", &name, "aiOff")
+    {
         return None;
     }
     let content = files::read_file(db, book_id, "细纲", &name)?;
@@ -172,7 +178,8 @@ mod tests {
     fn string_context_files_resolve_group_and_inject() {
         let (_d, db, bid) = setup();
         // 既有缺陷回归：runNextChapter 传字符串文件名，曾经被静默丢弃
-        let text = super::super::context_text(&db, &bid, &json!(["第1章细纲.md"]));
+        let (text, report) = super::super::context_text(&db, &bid, &json!(["第1章细纲.md"]));
+        assert_eq!(report[0]["status"], "ok");
         assert!(
             text.contains("MARKER_OUTLINE"),
             "string entry must inject: {}",

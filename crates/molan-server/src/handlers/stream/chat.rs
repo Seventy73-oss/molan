@@ -5,9 +5,9 @@ pub(crate) mod chat_contract;
 mod chat_snapshot;
 use super::super::AppState;
 use super::{auto_book_context, auto_humanize, auto_match_skills};
-use super::{auto_save_chat_output_checked, build_system, context_text, has_body_heading};
-use super::{effective_skills, skill_catalog, smart_archive};
+use super::{auto_save_chat_output_checked, context_text, has_body_heading};
 use super::{fallback, requested_chapter, resolve_book_style, stage_context};
+use super::{skill_catalog, smart_archive};
 use crate::handlers::{channel_id, chapter_num_from_name};
 use anyhow::{anyhow, Result};
 use molan_core::files;
@@ -259,13 +259,14 @@ pub(crate) async fn chat_stream(
         .into_iter()
         .map(Value::String)
         .collect();
+    // 对话自动路由：消息点名了技能卡 → 作为辅助挂载（手动勾选优先、去重；自动匹配不替代主技能）
+    let mut sel = molan_core::skill_resolver::Selection::from_args(args);
+    sel.auto_matched = auto_match_skills(db, &message)
+        .into_iter()
+        .filter(|n| !chosen_skills.iter().any(|v| v.as_str() == Some(n.as_str())))
+        .collect();
     let mut skill_names = chosen_skills.clone();
-    // 对话自动路由：消息点名了技能/文风卡 → 自动挂载（手动勾选优先，去重）
-    for n in auto_match_skills(db, &message) {
-        if !skill_names.iter().any(|v| v.as_str() == Some(n.as_str())) {
-            skill_names.push(json!(n));
-        }
-    }
+    skill_names.extend(sel.auto_matched.iter().map(|n| json!(n)));
 
     let task_hint = chat_contract::task(args)?;
     let role = chat_contract::role(&task_hint);
@@ -329,10 +330,13 @@ pub(crate) async fn chat_stream(
                 .and_then(|r| r["genre"].as_str().map(|s| s.to_string()))
         })
     };
-    let style: Option<String> = resolve_book_style(db, &st.root, &book_id, book_genre.as_deref());
-    // N01：按任务路由技能。主对话若点明写第N章/正文写作 → body；否则 chat。
+    // N01：按任务路由技能（统一 SkillResolver + 冻结计划；文风/去味覆盖同源生效）
     let chat_task = task_hint.clone();
-    let skills = effective_skills(db, &book_id, &chat_task, &skill_names);
+    let kind = molan_core::task_kind::TaskKind::parse(&chat_task)
+        .unwrap_or(molan_core::task_kind::TaskKind::Chat);
+    let plan = super::run_plan::build(db, &st.root, &book_id, kind, &sel)?;
+    let style = super::run_plan::style_text(&plan);
+    let skills = super::run_plan::skill_rows(&plan);
     let skill_debug: Vec<String> = skills
         .iter()
         .map(|s| {
@@ -343,7 +347,7 @@ pub(crate) async fn chat_stream(
             )
         })
         .collect();
-    let mut context = context_text(db, &book_id, &a("contextFiles"));
+    let (mut context, context_files) = context_text(db, &book_id, &a("contextFiles"));
     let auto_ctx = auto_book_context(db, &book_id, &message);
     if !auto_ctx.is_empty() {
         context = if context.is_empty() {
@@ -355,7 +359,7 @@ pub(crate) async fn chat_stream(
     // P2 契约：目标章细纲自动注入（显式引用去重、aiOff 尊重）；meta 回显注入项供审计
     let target_ch = requested_chapter(&message).unwrap_or(0);
     let stage_ol = stage_context::append_target_outline(db, &book_id, target_ch, &mut context);
-    let sys = build_system(
+    let sys = super::build_system_with(
         db,
         &st.root,
         &book_id,
@@ -364,6 +368,7 @@ pub(crate) async fn chat_stream(
         &skills,
         &message,
         &context,
+        &super::run_plan::humanize_method(&plan),
     );
     // 附加技能/文风目录：AI 全程知道有哪些写法可参考
     let catalog = skill_catalog(db);
@@ -378,7 +383,7 @@ pub(crate) async fn chat_stream(
         )
     };
     // 元事件：把本次实际生效的技能（名字:usage）发给前端/调试，便于确认主辅读取是否接通。
-    cx.ev(json!({"type": "meta", "task": chat_task, "role": role, "model": chn["model"], "allowSave": allow_stream_save, "effectiveSkills": skill_debug, "stageOutline": stage_ol}))
+    cx.ev(json!({"type": "meta", "task": chat_task, "role": role, "model": chn["model"], "allowSave": allow_stream_save, "effectiveSkills": skill_debug, "stageOutline": stage_ol, "planHash": plan["planHash"], "excludedSkills": plan["excluded"], "contextFiles": context_files}))
         .await;
     // 上下文清单（P0-3）：记录本轮实际注入的块与记忆覆盖度，只观测不阻断。
     // 后续任何"设定为什么没生效"都能回溯到这份清单（缺哪块、被预算裁掉几条）。
@@ -672,13 +677,8 @@ pub(crate) async fn chat_stream(
             && full.chars().count() >= 300
             && is_body_output
         {
-            let ov = a("humanizeOverride").as_str().unwrap_or("").to_string();
-            let ov = if ov.is_empty() {
-                None
-            } else {
-                Some(ov.as_str())
-            };
-            let humanize = auto_humanize(db, &book_id, &full, ov, "chapter");
+            let hz_plan = super::run_plan::humanize_stage(db, &st.root, &book_id, args);
+            let humanize = auto_humanize(db, &book_id, &full, &hz_plan, "chapter");
             let res = match cancel_tok.clone() {
                 Some(tok) => tokio::select! {
                     biased;
@@ -776,38 +776,26 @@ pub(crate) async fn chat_stream(
                 } else {
                     let ct2 = cancel_tok.clone();
                     let rid2 = req_id.clone();
-                    let save_result = files::write_ai_file_checked(
+                    // 写盘 + 待审登记 + 章节状态在同一把锁内完成（chapter_commit）
+                    match molan_core::chapter_commit::submit_pending(
                         db,
                         &book_id,
-                        molan_core::db::REVIEW_GROUP,
-                        &fname,
+                        target,
                         &full,
+                        "chat",
                         move || {
                             if abort_requested(&ct2) || take_abort(&rid2) {
                                 return Err(anyhow!("已请求停止，放弃落盘"));
                             }
                             Ok(())
                         },
-                    );
-                    if let Err(e) = save_result {
-                        save_errors.push(format!("第{}章待审落盘失败：{}", target, e));
-                    } else {
-                        if let Err(e) =
-                            crate::handlers::register_review_queue(db, &book_id, &fname, &full)
-                        {
-                            save_errors.push(format!(
-                                "第{}章文件已保存，但审批队列登记失败：{}",
-                                target, e
-                            ));
-                        }
-                        let _ = molan_core::chapter_state::record_save(
-                            db,
-                            &book_id,
-                            target,
+                    ) {
+                        Err(e) => save_errors.push(format!("第{}章待审：{}", target, e)),
+                        Ok(_) => files_saved.push(format!(
+                            "{} / {}",
                             molan_core::db::REVIEW_GROUP,
-                            &molan_core::continuity::content_hash(&full),
-                        );
-                        files_saved.push(format!("{} / {}", molan_core::db::REVIEW_GROUP, fname));
+                            fname
+                        )),
                     }
                 }
             }
@@ -914,20 +902,17 @@ pub(crate) async fn chat_stream(
                 .unwrap_or_default();
             if !review_cur.trim().is_empty() {
                 save_errors.push(format!("停机残稿未落盘：第{}章已有待审稿，未覆盖", ch));
-            } else if let Err(e) =
-                files::write_ai_file(db, &book_id, molan_core::db::REVIEW_GROUP, &fname, &raw)
-            {
+            } else if let Err(e) = molan_core::chapter_commit::submit_pending(
+                db,
+                &book_id,
+                ch,
+                &raw,
+                "chat:interrupted",
+                || Ok(()),
+            ) {
                 save_errors.push(format!("停机残稿落盘失败：{}", e));
             } else {
-                let _ = crate::handlers::register_review_queue(db, &book_id, &fname, &raw);
                 tracing::info!("停机残稿已存正文待审：{}", fname);
-                let _ = molan_core::chapter_state::record_save(
-                    db,
-                    &book_id,
-                    ch,
-                    molan_core::db::REVIEW_GROUP,
-                    &molan_core::continuity::content_hash(&raw),
-                );
                 let _ = molan_core::chapter_state::record_interrupted(
                     db,
                     &book_id,
@@ -991,12 +976,14 @@ pub(crate) async fn chat_stream(
         && !book_id.is_empty()
         && full.chars().count() >= 300
     {
+        let rv_plan = super::run_plan::review_stage(db, &st.root, &book_id, args);
         if let Some((ev, summary)) = super::chapter_review::review_pending_saved(
             db,
             &book_id,
             want_ch,
             &saved_files,
             cancel_tok.clone(),
+            &rv_plan,
         )
         .await
         {
@@ -1556,51 +1543,8 @@ pub(crate) async fn inline_chat(
 }
 
 // 把报告按块切开流式下发（前端按 delta 渲染）
-/// 解析选区引用消息头（与前端 glue.js 同源格式）：
-/// 【引用选区 · 文件名】\n原文\n\n【我的要求】…
-/// 目前「写回原文」提案由前端按钮走 dw_create_proposal，服务端不再调用本函数；
-/// 保留实现与其单测，作为选区 splice 契约的可验证参考（clippy -D warnings 需显式标注）。
-#[allow(dead_code)]
-fn parse_quote_selection(message: &str) -> Option<(String, String)> {
-    let head = message.strip_prefix("【引用选区")?;
-    let (name_part, rest) = head.split_once("】\n")?;
-    let name = name_part
-        .strip_prefix(" · ")
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let (text, _) = rest.split_once("\n\n【我的要求】")?;
-    if name.is_empty() || text.trim().is_empty() {
-        return None;
-    }
-    Some((name, text.to_string()))
-}
-
-/// 引用区间唯一匹配才允许 splice：0 处（原文已改）或 ≥2 处（歧义）都返回 None。
-/// 同 parse_quote_selection：保留实现与单测作为 splice 契约参考，当前无生产调用点。
-#[allow(dead_code)]
-fn splice_once(content: &str, quote: &str, replacement: &str) -> Option<String> {
-    let mut count = 0usize;
-    let mut idx = 0usize;
-    let mut pos = 0usize;
-    while let Some(found) = content[pos..].find(quote) {
-        count += 1;
-        idx = pos + found;
-        pos = idx + quote.len();
-        if count > 1 {
-            return None;
-        }
-    }
-    if count != 1 {
-        return None;
-    }
-    let mut out = String::with_capacity(content.len());
-    out.push_str(&content[..idx]);
-    out.push_str(replacement);
-    out.push_str(&content[idx + quote.len()..]);
-    Some(out)
-}
-
+// （旧的 parse_quote_selection/splice_once 文本搜索式选区替换已删除：选区写回统一走
+//  DocumentWriteService replace_range，按基线 hash + UTF-16 偏移 + 原文锚点精确替换。）
 fn split_chunks(s: &str, n: usize) -> Vec<String> {
     let cs: Vec<char> = s.chars().collect();
     if cs.len() <= n {
@@ -1725,26 +1669,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(molan_llm::CANCELLED_MSG));
-    }
-
-    #[test]
-    fn splice_requires_unique_match() {
-        let content = "甲段一\n乙段二\n甲段一";
-        assert!(splice_once(content, "甲段一", "X").is_none());
-        assert!(splice_once(content, "不存在", "X").is_none());
-        let one = "前\n乙段二\n后";
-        let out = splice_once(one, "乙段二", "NEW").unwrap();
-        assert_eq!(out, "前\nNEW\n后");
-    }
-
-    #[test]
-    fn parse_quote_selection_roundtrip() {
-        let msg = "【引用选区 · 细纲_第1章.md】\n原文内容\n\n【我的要求】只改这一段：";
-        let (name, text) = parse_quote_selection(msg).unwrap();
-        assert_eq!(name, "细纲_第1章.md");
-        assert_eq!(text, "原文内容");
-        assert!(parse_quote_selection("普通消息").is_none());
-        assert!(parse_quote_selection("【引用选区】\n原文\n\n【我的要求】x").is_none());
     }
 
     #[test]

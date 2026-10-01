@@ -1,0 +1,13 @@
+{
+  "aiOff": false,
+  "bookId": "<id>",
+  "chars": 3,
+  "content": "阿青\n",
+  "exists": true,
+  "group": "设定",
+  "hash": "<sha256>",
+  "locked": false,
+  "name": "人物.md",
+  "revision": 1,
+  "utf16Len": 3
+}

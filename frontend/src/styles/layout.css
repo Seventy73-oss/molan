@@ -1,0 +1,372 @@
+/* ---------- 应用外壳 ---------- */
+.app {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  height: 100%;
+  min-height: 0;
+}
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: calc(var(--sp-3) + env(safe-area-inset-top)) 6px calc(var(--sp-3) + env(safe-area-inset-bottom));
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  z-index: 20;
+}
+
+.rail__brand {
+  margin-bottom: var(--sp-3);
+}
+
+.rail__logo {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-family: var(--font-serif);
+  font-size: 19px;
+  font-weight: 700;
+}
+
+.rail__item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 52px;
+  padding: 7px 0 5px;
+  border: 0;
+  border-radius: var(--r-1);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 11px;
+  text-decoration: none !important;
+}
+
+.rail__item:hover {
+  background: var(--subtle);
+  color: var(--text);
+}
+
+.rail__item--active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.rail__spacer {
+  flex: 1;
+}
+
+.main {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.boot-error {
+  margin: var(--sp-3) var(--sp-4) 0;
+}
+
+.page-loading {
+  display: grid;
+  place-items: center;
+  height: 100%;
+}
+
+/* ---------- 普通页面 ---------- */
+.page {
+  height: 100%;
+  overflow: auto;
+  padding: var(--sp-5) max(var(--sp-4), 4vw) var(--sp-7);
+}
+
+.page__inner {
+  max-width: 1120px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+}
+
+.page__head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.page__title {
+  font-family: var(--font-serif);
+  font-size: 26px;
+  letter-spacing: 0.02em;
+}
+
+.page__sub {
+  color: var(--text-2);
+  margin-top: 4px;
+}
+
+/* ---------- 工作台 ---------- */
+.ws {
+  container-type: inline-size;
+  container-name: ws;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  min-height: 0;
+}
+
+.ws__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 52px;
+  padding: calc(6px + env(safe-area-inset-top)) var(--sp-3) 6px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  min-width: 0;
+}
+
+.ws__title {
+  font-family: var(--font-serif);
+  font-size: 17px;
+  font-weight: 600;
+  min-width: 0;
+}
+
+.ws__crumb {
+  color: var(--text-2);
+  font-size: 13px;
+  min-width: 0;
+}
+
+.ws__body {
+  display: grid;
+  grid-template-columns: var(--left-w, 260px) minmax(0, 1fr) var(--right-w, 420px);
+  min-height: 0;
+  position: relative;
+}
+
+.ws__body--no-left {
+  grid-template-columns: 0 minmax(0, 1fr) var(--right-w, 420px);
+}
+
+.ws__body--no-right {
+  grid-template-columns: var(--left-w, 260px) minmax(0, 1fr) 0;
+}
+
+.ws__body--no-left.ws__body--no-right {
+  grid-template-columns: 0 minmax(0, 1fr) 0;
+}
+
+/* 显式落位：目录改为绝对定位抽屉时脱离网格流，不能让书稿区被挤进第一列 */
+.ws__left {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.ws__center {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.ws__right {
+  grid-column: 3;
+  grid-row: 1;
+}
+
+.ws__left,
+.ws__right {
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+}
+
+.ws__left {
+  border-right: 1px solid var(--border);
+}
+
+.ws__right {
+  border-left: 1px solid var(--border);
+}
+
+.ws__body--no-left .ws__left,
+.ws__body--no-right .ws__right {
+  border: 0;
+  visibility: hidden;
+}
+
+.ws__center {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.ws__resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: col-resize;
+  z-index: 5;
+}
+
+.ws__resizer:hover,
+.ws__resizer--drag {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.ws--focus .ws__bar {
+  opacity: 0.4;
+  transition: opacity var(--dur) var(--ease);
+}
+
+.ws--focus .ws__bar:hover {
+  opacity: 1;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--border);
+  min-height: 46px;
+}
+
+.panel-head > .tabs {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.panel-head > .icon-btn {
+  flex: 0 0 auto;
+}
+
+.panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+/* 中等宽度：左侧目录改抽屉 */
+@container ws (max-width: 1080px) {
+  .ws__body,
+  .ws__body--no-left {
+    grid-template-columns: 0 minmax(0, 1fr) var(--right-w, 380px);
+  }
+  .ws__body--no-right,
+  .ws__body--no-left.ws__body--no-right {
+    grid-template-columns: 0 minmax(0, 1fr) 0;
+  }
+  .ws__left {
+    /* 抽屉：跨整个网格作为包含块（绝对定位网格子项以其网格区域为包含块） */
+    grid-column: 1 / -1;
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: min(300px, 86vw);
+    z-index: 15;
+    box-shadow: var(--shadow-pop);
+    visibility: visible;
+  }
+  .ws__body--no-left .ws__left {
+    display: none;
+  }
+  .ws__resizer--left {
+    display: none;
+  }
+}
+
+/* 窄：单栏，右侧辅助区改全屏抽屉 */
+@container ws (max-width: 760px) {
+  .ws__body,
+  .ws__body--no-left,
+  .ws__body--no-right,
+  .ws__body--no-left.ws__body--no-right {
+    grid-template-columns: 0 minmax(0, 1fr) 0;
+  }
+  .ws__right {
+    grid-column: 1 / -1;
+    position: absolute;
+    inset: 0;
+    z-index: 16;
+    visibility: visible;
+    border: 0;
+  }
+  .ws__body--no-right .ws__right {
+    display: none;
+  }
+  .ws__resizer {
+    display: none;
+  }
+  .ws__crumb {
+    display: none;
+  }
+}
+
+/* ---------- 手机：导航改底部栏 ---------- */
+@media (max-width: 720px) {
+  .app {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+  .rail {
+    grid-row: 2;
+    flex-direction: row;
+    justify-content: space-around;
+    padding: 4px 4px calc(4px + env(safe-area-inset-bottom));
+    border-right: 0;
+    border-top: 1px solid var(--border);
+  }
+  .rail__brand,
+  .rail__spacer {
+    display: none;
+  }
+  .rail__item {
+    width: auto;
+    flex: 1;
+  }
+  .main {
+    grid-row: 1;
+  }
+  .app--workspace .rail {
+    display: none;
+  }
+  .app--workspace {
+    grid-template-rows: minmax(0, 1fr);
+  }
+  .page {
+    padding: var(--sp-4) var(--sp-4) var(--sp-6);
+  }
+  .page__title {
+    font-size: 22px;
+  }
+  .dialog__body {
+    padding: var(--sp-3) var(--sp-4);
+  }
+  .dialog__foot {
+    padding: var(--sp-3) var(--sp-4);
+  }
+  .dialog__foot .btn {
+    flex: 1 1 auto;
+  }
+}
